@@ -9,11 +9,15 @@ import streamlit as st
 
 
 # ----------------------------
-# Helpers
+# Config
 # ----------------------------
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
+DEFAULT_POSSESSIONS = 68.0
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def clean(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
@@ -28,11 +32,21 @@ def resolve(name: str, lookup: dict[str, str]) -> str:
     raise ValueError(f"Could not resolve team name: {name}")
 
 
+def _safe_num(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 # ----------------------------
 # Torvik Ratings (safe loader)
 # ----------------------------
 @st.cache_data(ttl=3600)
 def load_torvik_team_results(year: int) -> pd.DataFrame:
+    """
+    year=2026 corresponds to the 2025-26 season file: https://barttorvik.com/2026_team_results.csv
+    """
     url = f"https://barttorvik.com/{year}_team_results.csv"
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
@@ -43,6 +57,7 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
+    # Normalize TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -68,10 +83,12 @@ def find_col(df: pd.DataFrame, patterns: list[str]) -> str:
 
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     df = df.rename(columns={
         find_col(df, ["AdjOE", r"\bOE\b"]): "ADJ_OE",
         find_col(df, ["AdjDE", r"\bDE\b"]): "ADJ_DE",
     })
+
     try:
         df = df.rename(columns={find_col(df, ["AdjT", "Tempo", "Pace", "Poss"]): "TEMPO"})
     except Exception:
@@ -85,78 +102,101 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
-# Slate (use schedule.php&csv=1, no HTML tables)
+# Slate source (NCAA data feed)
 # ----------------------------
 @st.cache_data(ttl=600)
-def get_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
+def get_ncaa_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str]:
     """
-    Pull slate as CSV from schedule.php using &csv=1.
-    This avoids pandas read_html (No tables found) and Torvik HTML changes.
+    NCAA scoreboard feed (men's D1):
+    https://data.ncaa.com/casablanca/scoreboard/basketball-men/d1/YYYY/MM/DD/scoreboard.json
     """
-    url = f"https://barttorvik.com/schedule.php?date={date_yyyymmdd}&conlimit=&csv=1"
+    url = f"https://data.ncaa.com/casablanca/scoreboard/basketball-men/d1/{date_val:%Y/%m/%d}/scoreboard.json"
 
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=30)
         r.raise_for_status()
-        text = r.text
+        data = r.json()
     except Exception:
         return pd.DataFrame(), url
 
-    # If Torvik returns an HTML "verifying your browser" page, it will start with "<"
-    if text.lstrip().startswith("<"):
+    # The feed structure can vary; try common paths first.
+    games = None
+    if isinstance(data, dict):
+        for key in ["games", "Game", "scoreboard", "events"]:
+            if key in data and isinstance(data[key], list):
+                games = data[key]
+                break
+
+    # If not found, try nested common patterns
+    if games is None and isinstance(data, dict):
+        # Some NCAA feeds put games under "scoreboard" -> "games"
+        sb = data.get("scoreboard")
+        if isinstance(sb, dict) and isinstance(sb.get("games"), list):
+            games = sb["games"]
+
+    if not isinstance(games, list) or len(games) == 0:
         return pd.DataFrame(), url
 
-    # Try reading as CSV
-    try:
-        df = pd.read_csv(StringIO(text))
-    except Exception:
-        return pd.DataFrame(), url
+    rows = []
+    for g in games:
+        if not isinstance(g, dict):
+            continue
 
-    df.columns = [str(c).strip() for c in df.columns]
+        # Try to find team names in a robust way
+        away = None
+        home = None
+        neutral = False
 
-    # Need a matchup column (Torvik usually provides Matchup)
-    matchup_col = None
-    for c in df.columns:
-        if "matchup" in str(c).lower():
-            matchup_col = c
-            break
-    if matchup_col is None:
-        return pd.DataFrame(), url
+        # Common keys in NCAA payloads
+        # - "away" / "home" objects with "names" or "shortName"
+        a_obj = g.get("away") if isinstance(g.get("away"), dict) else None
+        h_obj = g.get("home") if isinstance(g.get("home"), dict) else None
 
-    df = df.rename(columns={matchup_col: "Matchup"})
-    df["Matchup"] = df["Matchup"].astype(str)
+        if a_obj:
+            away = a_obj.get("shortName") or a_obj.get("name") or a_obj.get("displayName")
+        if h_obj:
+            home = h_obj.get("shortName") or h_obj.get("name") or h_obj.get("displayName")
 
-    # Keep only real games
-    df = df[df["Matchup"].str.contains(r"\s(at|vs)\s", case=False, regex=True)].reset_index(drop=True)
-    return df, url
+        # Sometimes teams appear under "teams": [{"homeAway":"home",...}, ...]
+        if (not away or not home) and isinstance(g.get("teams"), list):
+            for t in g["teams"]:
+                if not isinstance(t, dict):
+                    continue
+                ha = (t.get("homeAway") or t.get("home_away") or "").lower()
+                nm = t.get("shortName") or t.get("name") or t.get("displayName")
+                if ha == "away":
+                    away = nm
+                elif ha == "home":
+                    home = nm
 
+        # Neutral site flags (varies)
+        neutral = bool(g.get("neutralSite") or g.get("isNeutralSite") or g.get("neutral_site") or False)
 
-def parse_matchup(matchup: str):
-    m = str(matchup).strip()
-    if re.search(r"\s+vs\s+", m, flags=re.IGNORECASE):
-        a, h = re.split(r"\s+vs\s+", m, flags=re.IGNORECASE)
-        return a.strip(), h.strip(), True
-    if re.search(r"\s+at\s+", m, flags=re.IGNORECASE):
-        a, h = re.split(r"\s+at\s+", m, flags=re.IGNORECASE)
-        return a.strip(), h.strip(), False
-    return None, None, None
+        if not away or not home:
+            continue
+
+        matchup = f"{away} vs {home}" if neutral else f"{away} at {home}"
+        rows.append({"Away": away, "Home": home, "Neutral": int(neutral), "Matchup": matchup})
+
+    df = pd.DataFrame(rows).drop_duplicates()
+    return df.reset_index(drop=True), url
 
 
 # ----------------------------
-# Prediction
+# Prediction engine
 # ----------------------------
-def predict(df: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n: int, sd: float) -> dict:
-    lookup = {clean(t): t for t in df["TEAM"].dropna().unique()}
+def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n: int, sd: float) -> dict:
+    lookup = {clean(t): t for t in df_teams["TEAM"].dropna().unique()}
 
     away_team = resolve(away, lookup)
     home_team = resolve(home, lookup)
 
-    a = df[df["TEAM"] == away_team].iloc[0]
-    h = df[df["TEAM"] == home_team].iloc[0]
+    a = df_teams[df_teams["TEAM"] == away_team].iloc[0]
+    h = df_teams[df_teams["TEAM"] == home_team].iloc[0]
 
     poss = float(np.nanmean([a.get("TEMPO", np.nan), h.get("TEMPO", np.nan)]))
     if np.isnan(poss):
-        poss = 68.0
+        poss = DEFAULT_POSSESSIONS
 
     away_pp100 = (float(a["ADJ_OE"]) + float(h["ADJ_DE"])) / 2.0
     home_pp100 = (float(h["ADJ_OE"]) + float(a["ADJ_DE"])) / 2.0
@@ -174,7 +214,7 @@ def predict(df: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n
     return {
         "Away": away_team,
         "Home": home_team,
-        "Neutral": neutral,
+        "Neutral": bool(neutral),
         "Proj_Away": away_pts,
         "Proj_Home": home_pts,
         "Proj_Total": away_pts + home_pts,
@@ -183,41 +223,42 @@ def predict(df: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n
     }
 
 
-def run(year: int, date_yyyymmdd: str, n: int, hca: float, sd: float) -> tuple[pd.DataFrame, str]:
-    teams = standardize(load_torvik_team_results(year))
-    slate, url = get_slate(date_yyyymmdd)
+def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float) -> tuple[pd.DataFrame, str]:
+    teams = standardize(load_torvik_team_results(season_year))
+    slate, slate_url = get_ncaa_daily_slate(date_val)
 
     if slate.empty:
-        return pd.DataFrame(), url
+        return pd.DataFrame(), slate_url
 
     rows = []
     for _, row in slate.iterrows():
-        away, home, neutral = parse_matchup(row["Matchup"])
-        if away is None:
-            continue
+        away = str(row["Away"]).strip()
+        home = str(row["Home"]).strip()
+        neutral = bool(int(row.get("Neutral", 0)))
 
         try:
-            r = predict(teams, away, home, neutral, hca, n, sd)
-            r["Matchup"] = row["Matchup"]
-            rows.append(r)
+            pred = predict_game(teams, away, home, neutral, hca, n, sd)
+            pred["Matchup"] = row.get("Matchup", f"{away} at {home}")
+            rows.append(pred)
         except Exception as e:
-            rows.append({"Matchup": row["Matchup"], "Error": str(e)})
+            rows.append({"Matchup": row.get("Matchup", f"{away} at {home}"), "Error": str(e)})
 
     out = pd.DataFrame(rows)
     if not out.empty and "Proj_Margin_Home" in out.columns:
         out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
         out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
 
-    return out, url
+    return out, slate_url
 
 
 # ----------------------------
 # UI
 # ----------------------------
-st.set_page_config(page_title="CBB Torvik Slate Predictor", layout="wide")
-st.title("CBB Torvik Slate Predictor")
+st.set_page_config(page_title="CBB Slate Predictor", layout="wide")
+st.title("CBB Slate Predictor (NCAA slate + Torvik ratings)")
 
 with st.sidebar:
+    st.header("Settings")
     season = st.number_input("Season year (2026 = 2025–26)", value=2026, step=1)
     date_val = st.date_input("Slate date", value=dt.date.today())
     sims = st.slider("Simulations", 1000, 20000, 10000, step=1000)
@@ -226,21 +267,12 @@ with st.sidebar:
     auto_run = st.checkbox("Run automatically", value=True)
     run_btn = st.button("Run slate")
 
-date_yyyymmdd = date_val.strftime("%Y%m%d")
-should_run = auto_run or run_btn
-
-if should_run:
-    data, url = run(int(season), date_yyyymmdd, int(sims), float(hca), float(sd))
-    st.caption(f"Slate source: {url}")
+if auto_run or run_btn:
+    data, slate_url = run_slate(int(season), date_val, int(sims), float(hca), float(sd))
+    st.caption(f"Slate source: {slate_url}")
 
     if data.empty:
-        st.warning("No games found for this date (or Torvik blocked the CSV output).")
-        st.caption("If you KNOW there are games, open the slate source link above. If it shows an HTML verification page, Torvik is blocking Streamlit Cloud.")
-        st.stop()
-
-    if "Error" in data.columns and data.shape[1] <= 3:
-        st.error("Most matchups failed to resolve.")
-        st.dataframe(data, use_container_width=True)
+        st.warning("No games returned from the NCAA feed for this date.")
         st.stop()
 
     c1, c2, c3 = st.columns(3)
@@ -257,4 +289,4 @@ if should_run:
     st.subheader("All games")
     st.dataframe(data.sort_values("Matchup"), use_container_width=True)
 else:
-    st.info("Use the sidebar and click **Run slate** (or enable **Run automatically**).")
+    st.info("Enable **Run automatically** or click **Run slate**.")
