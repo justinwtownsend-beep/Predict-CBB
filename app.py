@@ -3,19 +3,28 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
+from io import StringIO
 
 # ----------------------------
-# Data pull + standardization
+# Torvik Ratings (safe loader)
 # ----------------------------
-@st.cache_data(ttl=60 * 60)
-def load_torvik_team_results(year: int) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def load_torvik_team_results(year):
     url = f"https://barttorvik.com/{year}_team_results.csv"
-    df = pd.read_csv(url)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
 
-    # Normalize TEAM column
+    text = r.text
+    if text.lstrip().startswith("<"):
+        raise ValueError("Torvik returned HTML instead of CSV")
+
+    df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
+
+    # Normalize team column
     team_col = None
     for c in df.columns:
-        if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
+        if c.strip().lower() in {"team", "teams", "teamname"} or c.upper() == "TEAM":
             team_col = c
             break
     if team_col is None:
@@ -26,212 +35,156 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
     return df
 
 
-def _find_col(df: pd.DataFrame, patterns: list[str]) -> str:
-    cols = list(df.columns)
-    for pat in patterns:
-        rx = re.compile(pat, re.IGNORECASE)
-        for c in cols:
-            if rx.fullmatch(c) or rx.search(c):
+def find_col(df, patterns):
+    for p in patterns:
+        rx = re.compile(p, re.IGNORECASE)
+        for c in df.columns:
+            if rx.search(str(c)):
                 return c
-    raise KeyError(f"Missing column for {patterns}. Columns: {cols}")
+    raise KeyError(f"Column not found: {patterns}")
 
 
-def standardize_torvik_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    col_adj_oe = _find_col(out, [r"AdjOE", r"ADJ.*OE", r"OE.*Adj"])
-    col_adj_de = _find_col(out, [r"AdjDE", r"ADJ.*DE", r"DE.*Adj"])
-
+def standardize(df):
+    df = df.copy()
+    df = df.rename(columns={
+        find_col(df, ["AdjOE", "OE"]): "ADJ_OE",
+        find_col(df, ["AdjDE", "DE"]): "ADJ_DE",
+    })
     try:
-        col_tempo = _find_col(out, [r"AdjT", r"Tempo", r"Pace", r"Poss"])
-    except KeyError:
-        col_tempo = None
-
-    rename_map = {col_adj_oe: "ADJ_OE", col_adj_de: "ADJ_DE"}
-    if col_tempo:
-        rename_map[col_tempo] = "TEMPO"
-
-    out = out.rename(columns=rename_map)
+        df = df.rename(columns={find_col(df, ["AdjT", "Tempo", "Pace", "Poss"]): "TEMPO"})
+    except:
+        pass
 
     for c in ["ADJ_OE", "ADJ_DE", "TEMPO"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return out
-
-
-def build_team_lookup(df: pd.DataFrame) -> dict[str, str]:
-    def simp(s: str) -> str:
-        s = s.lower().strip()
-        s = re.sub(r"[^a-z0-9 ]+", "", s)
-        s = re.sub(r"\s+", " ", s)
-        return s
-
-    lookup = {}
-    for t in df["TEAM"].dropna().unique():
-        lookup[simp(t)] = t
-    return lookup
-
-
-def resolve_team_name(user_input: str, lookup: dict[str, str]) -> str:
-    def simp(s: str) -> str:
-        s = s.lower().strip()
-        s = re.sub(r"[^a-z0-9 ]+", "", s)
-        s = re.sub(r"\s+", " ", s)
-        return s
-
-    key = simp(user_input)
-    if key in lookup:
-        return lookup[key]
-
-    candidates = [(k, v) for k, v in lookup.items() if key in k or k in key]
-    if len(candidates) == 1:
-        return candidates[0][1]
-    if len(candidates) > 1:
-        candidates.sort(key=lambda kv: len(kv[0]))
-        return candidates[0][1]
-
-    raise ValueError(f"Could not resolve team: '{user_input}'")
+    return df
 
 
 # ----------------------------
-# Slate pull (UPDATED - picks correct table)
+# Schedule (correct table)
 # ----------------------------
-@st.cache_data(ttl=10 * 60)
-def get_torvik_daily_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
-    """
-    Pull Torvik daily schedule for a given date.
-    Fix: Torvik pages can have multiple tables. We select the one that contains a Matchup column.
-    """
-    url = f"https://barttorvik.com/schedule.php?conlimit=&date={date_yyyymmdd}&sort=time"
+@st.cache_data(ttl=600)
+def get_slate(date):
+    url = f"https://barttorvik.com/schedule.php?date={date}&conlimit="
+    tables = pd.read_html(url, flavor="bs4")
 
-    try:
-        tables = pd.read_html(url, flavor="bs4")
-    except Exception:
-        return pd.DataFrame(), url
-
-    if not tables:
-        return pd.DataFrame(), url
-
-    # ✅ pick the table that actually contains a matchup column
-    slate_df = None
+    slate = None
     for t in tables:
-        t = t.copy()
-        t.columns = [str(c).strip() for c in t.columns]
-        if any("matchup" in str(c).lower() for c in t.columns):
-            slate_df = t
+        t.columns = [str(c) for c in t.columns]
+        if any("Matchup" in c for c in t.columns):
+            slate = t
             break
 
-    if slate_df is None:
+    if slate is None:
         return pd.DataFrame(), url
 
-    # Normalize matchup column
-    matchup_col = [c for c in slate_df.columns if "matchup" in str(c).lower()][0]
-    slate_df = slate_df.rename(columns={matchup_col: "Matchup"})
-
-    # Keep only rows that look like real games
-    slate_df["Matchup"] = slate_df["Matchup"].astype(str)
-    slate_df = slate_df[slate_df["Matchup"].str.contains(r"\s(at|vs)\s", case=False, regex=True)].reset_index(drop=True)
-
-    return slate_df, url
-
-
-def parse_matchup(matchup: str):
-    m = str(matchup).strip()
-    if re.search(r"\s+vs\s+", m, flags=re.IGNORECASE):
-        a, h = re.split(r"\s+vs\s+", m, flags=re.IGNORECASE)
-        return a.strip(), h.strip(), True
-    if re.search(r"\s+at\s+", m, flags=re.IGNORECASE):
-        a, h = re.split(r"\s+at\s+", m, flags=re.IGNORECASE)
-        return a.strip(), h.strip(), False
-    return None, None, None
+    matchup_col = [c for c in slate.columns if "Matchup" in c][0]
+    slate = slate.rename(columns={matchup_col: "Matchup"})
+    slate = slate[slate["Matchup"].astype(str).str.contains(" at | vs ", regex=True)]
+    return slate.reset_index(drop=True), url
 
 
 # ----------------------------
-# Prediction
+# Team name matching
 # ----------------------------
-def predict_cbb_game(df_teams, away, home, neutral, hca_points, n_sims, margin_sd):
-    lookup = build_team_lookup(df_teams)
-    away_team = resolve_team_name(away, lookup)
-    home_team = resolve_team_name(home, lookup)
+def clean(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
-    a = df_teams.loc[df_teams["TEAM"] == away_team].iloc[0]
-    h = df_teams.loc[df_teams["TEAM"] == home_team].iloc[0]
 
-    poss = float(np.nanmean([a.get("TEMPO", np.nan), h.get("TEMPO", np.nan)]))
+def resolve(name, lookup):
+    c = clean(name)
+    if c in lookup:
+        return lookup[c]
+    for k in lookup:
+        if c in k or k in c:
+            return lookup[k]
+    raise ValueError(name)
+
+
+# ----------------------------
+# Prediction engine
+# ----------------------------
+def predict(df, away, home, neutral, hca, n, sd):
+    lookup = {clean(t): t for t in df["TEAM"]}
+    a = df[df["TEAM"] == resolve(away, lookup)].iloc[0]
+    h = df[df["TEAM"] == resolve(home, lookup)].iloc[0]
+
+    poss = np.nanmean([a.get("TEMPO", 68), h.get("TEMPO", 68)])
     if np.isnan(poss):
-        poss = 68.0
+        poss = 68
 
-    away_pp100 = (float(a["ADJ_OE"]) + float(h["ADJ_DE"])) / 2.0
-    home_pp100 = (float(h["ADJ_OE"]) + float(a["ADJ_DE"])) / 2.0
+    away_pp = (a["ADJ_OE"] + h["ADJ_DE"]) / 2
+    home_pp = (h["ADJ_OE"] + a["ADJ_DE"]) / 2
 
-    away_pts = (away_pp100 / 100.0) * poss
-    home_pts = (home_pp100 / 100.0) * poss
+    away_pts = away_pp / 100 * poss
+    home_pts = home_pp / 100 * poss
 
     if not neutral:
-        home_pts += hca_points / 2.0
-        away_pts -= hca_points / 2.0
+        home_pts += hca / 2
+        away_pts -= hca / 2
 
-    mean_margin = home_pts - away_pts
-
-    rng = np.random.default_rng(7)
-    sims_margin = rng.normal(loc=mean_margin, scale=margin_sd, size=n_sims)
-    home_win_prob = float(np.mean(sims_margin > 0))
+    margin = home_pts - away_pts
+    sims = np.random.normal(margin, sd, n)
 
     return {
-        "Away": away_team,
-        "Home": home_team,
-        "Neutral": neutral,
+        "Away": away,
+        "Home": home,
         "Proj_Away": away_pts,
         "Proj_Home": home_pts,
-        "Proj_Total": home_pts + away_pts,
-        "Proj_Margin_Home": mean_margin,
-        "Home_Win_%": home_win_prob * 100,
+        "Proj_Total": away_pts + home_pts,
+        "Proj_Margin": margin,
+        "Home_Win_%": (sims > 0).mean() * 100,
     }
 
 
-def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin_sd):
-    raw = load_torvik_team_results(year)
-    df_teams = standardize_torvik_columns(raw)
+# ----------------------------
+# Run slate
+# ----------------------------
+def run(year, date, n, hca, sd):
+    df = standardize(load_torvik_team_results(year))
+    slate, url = get_slate(date)
 
-    slate, slate_url = get_torvik_daily_slate(date_yyyymmdd)
     if slate.empty:
-        return pd.DataFrame(), slate_url
+        return pd.DataFrame(), url
 
     rows = []
-
-    for _, r in slate.iterrows():
-        away, home, neutral = parse_matchup(r["Matchup"])
-        if away is None:
-            continue
+    for m in slate["Matchup"]:
+        if " vs " in m:
+            a, h = m.split(" vs ")
+            neutral = True
+        else:
+            a, h = m.split(" at ")
+            neutral = False
 
         try:
-            res = predict_cbb_game(
-                df_teams=df_teams,
-                away=away,
-                home=home,
-                neutral=neutral,
-                hca_points=hca_points,
-                n_sims=n_sims,
-                margin_sd=margin_sd
-            )
+            r = predict(df, a.strip(), h.strip(), neutral, hca, n, sd)
+            r["Matchup"] = m
+            rows.append(r)
+        except:
+            pass
 
-            res["Matchup"] = r["Matchup"]
-            rows.append(res)
-
-        except Exception as e:
-            rows.append({
-                "Matchup": r["Matchup"],
-                "Error": str(e)
-            })
-
-    out = pd.DataFrame(rows)
-
-    if "Proj_Margin_Home" in out.columns:
-        out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
-        out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
-
-    return out, slate_url
+    return pd.DataFrame(rows), url
 
 
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(layout="wide")
+st.title("CBB Torvik Slate Predictor")
 
+with st.sidebar:
+    season = st.number_input("Season year (2026 = 2025–26)", 2026)
+    date = st.date_input("Slate date", dt.date.today()).strftime("%Y%m%d")
+    sims = st.slider("Simulations", 1000, 20000, 10000)
+    hca = st.slider("Home court advantage", 0.0, 5.0, 2.5)
+    sd = st.slider("Margin SD", 6.0, 18.0, 11.0)
 
+data, url = run(season, date, sims, hca, sd)
+st.caption(url)
+
+if data.empty:
+    st.warning("No games found for this date.")
+else:
+    st.dataframe(data.sort_values("Proj_Margin", ascending=False))
