@@ -1,52 +1,231 @@
 import datetime as dt
 import re
 from io import StringIO
+from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
+
+# ============================
+# Config
+# ============================
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 DEFAULT_POSSESSIONS = 68.0
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def clean(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+# ============================
+# Text normalization + matching
+# ============================
+STOPWORDS = {
+    "university", "college", "the", "of", "and", "at", "a", "an",
+    "mens", "men", "womens", "women"
+}
+
+ABBREV_MAP = {
+    "st": "state",
+    "st.": "state",
+    "ste": "stephen",
+    "ft": "fort",
+    "ft.": "fort",
+    "mt": "mount",
+    "mt.": "mount",
+    "u": "university",
+    "univ": "university",
+    "tech": "tech",
+    "a&m": "am",
+    "aandm": "am",
+    "&": "and",
+}
+
+DIRECTION_MAP = {
+    "n": "north",
+    "s": "south",
+    "e": "east",
+    "w": "west",
+    "ne": "northeast",
+    "nw": "northwest",
+    "se": "southeast",
+    "sw": "southwest",
+}
+
+# Common ESPN shortenings that benefit from expansion
+SPECIAL_PHRASES = [
+    ("md", "maryland"),
+    ("ar", "arkansas"),
+    ("la", "louisiana"),
+    ("tx", "texas"),
+    ("nm", "new mexico"),
+    ("nc", "north carolina"),
+    ("sc", "south carolina"),
+]
 
 
-def resolve(name: str, lookup: dict[str, str]) -> str:
-    key = clean(name)
-    if key in lookup:
-        return lookup[key]
-    # fallback contains-match
-    for k, v in lookup.items():
-        if key in k or k in key:
-            return v
-    raise ValueError(f"Could not resolve team name: {name}")
+def _basic_clean(s: str) -> str:
+    s = str(s).lower().strip()
+    s = s.replace("\u2019", "'")
+    s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
+    s = re.sub(r"[^a-z0-9&\.\-\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def pick_first(*vals):
-    for v in vals:
-        if v is None:
+def tokenize(name: str) -> list[str]:
+    s = _basic_clean(name)
+
+    # replace some punctuation that matters in team names
+    s = s.replace("-", " ")
+    s = s.replace(".", "")
+    s = s.replace("&", " & ")
+
+    parts = [p for p in s.split() if p]
+
+    out = []
+    for p in parts:
+        if p in DIRECTION_MAP:
+            out.append(DIRECTION_MAP[p])
             continue
-        if isinstance(v, str) and v.strip() == "":
+        if p in ABBREV_MAP:
+            out.append(ABBREV_MAP[p])
             continue
-        return v
-    return None
+        out.append(p)
+
+    # expand special phrases at token level (e.g., "md" -> "maryland")
+    expanded = []
+    for t in out:
+        replaced = False
+        for a, b in SPECIAL_PHRASES:
+            if t == a:
+                expanded.extend(b.split())
+                replaced = True
+                break
+        if not replaced:
+            expanded.append(t)
+
+    # drop stopwords
+    expanded = [t for t in expanded if t not in STOPWORDS]
+
+    return expanded
 
 
-# ----------------------------
-# Torvik Ratings (safe loader)
-# ----------------------------
+def normalize_key(name: str) -> str:
+    toks = tokenize(name)
+    return "".join(toks)
+
+
+def jaccard(a_tokens: set[str], b_tokens: set[str]) -> float:
+    if not a_tokens or not b_tokens:
+        return 0.0
+    inter = len(a_tokens & b_tokens)
+    union = len(a_tokens | b_tokens)
+    return inter / union if union else 0.0
+
+
+def seq_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def score_match(query_name: str, cand) -> float:
+    """
+    cand is a dict with:
+      - key: normalized string
+      - tokens: set[str]
+    """
+    q_key = normalize_key(query_name)
+    q_tokens = set(tokenize(query_name))
+
+    # blend character similarity + token overlap
+    s1 = seq_ratio(q_key, cand["key"])
+    s2 = jaccard(q_tokens, cand["tokens"])
+    return 0.65 * s1 + 0.35 * s2
+
+
+def generate_query_variants(name: str) -> list[str]:
+    """
+    Create a handful of variants so ESPN short names match Torvik more often.
+    """
+    s = _basic_clean(name)
+
+    variants = {s}
+
+    # common shortenings
+    variants.add(s.replace(" st ", " state "))
+    variants.add(s.replace(" st.", " state "))
+    variants.add(s.replace(" & ", " and "))
+    variants.add(s.replace(" a&m ", " am "))
+
+    # directional expansions
+    for k, v in DIRECTION_MAP.items():
+        variants.add(re.sub(rf"\b{k}\b", v, s))
+
+    # remove "the"
+    variants.add(re.sub(r"\bthe\b", "", s).strip())
+
+    # remove punctuation again
+    variants = {re.sub(r"\s+", " ", v).strip() for v in variants if v.strip()}
+
+    return list(variants)
+
+
+@st.cache_data(ttl=3600)
+def build_torvik_candidate_index(torvik_teams: list[str]):
+    """
+    Precompute candidate keys/tokens for fast matching.
+    """
+    cands = []
+    for t in torvik_teams:
+        cands.append({
+            "team": t,
+            "key": normalize_key(t),
+            "tokens": set(tokenize(t)),
+        })
+    return cands
+
+
+def auto_map_team(name: str, candidates, force_pick: bool = True):
+    """
+    Returns: (mapped_team, confidence_score, second_best_score)
+    If force_pick=True, always returns the best candidate (even low confidence).
+    """
+    best_team = None
+    best_score = -1.0
+    second_score = -1.0
+
+    for variant in generate_query_variants(name):
+        for cand in candidates:
+            s = score_match(variant, cand)
+            if s > best_score:
+                second_score = best_score
+                best_score = s
+                best_team = cand["team"]
+            elif s > second_score:
+                second_score = s
+
+    if best_team is None:
+        if force_pick and candidates:
+            return candidates[0]["team"], 0.0, 0.0
+        raise ValueError(f"Could not map team: {name}")
+
+    return best_team, float(best_score), float(second_score)
+
+
+# ============================
+# Torvik loader (robust)
+# ============================
+def find_col(df: pd.DataFrame, patterns: list[str]) -> str:
+    cols = list(df.columns)
+    for pat in patterns:
+        rx = re.compile(pat, re.IGNORECASE)
+        for c in cols:
+            if rx.search(str(c)):
+                return c
+    raise KeyError(f"Could not find column matching: {patterns}. Columns={cols}")
+
+
 @st.cache_data(ttl=3600)
 def load_torvik_team_results(year: int) -> pd.DataFrame:
-    """
-    year=2026 corresponds to the 2025-26 season file: https://barttorvik.com/2026_team_results.csv
-    """
     url = f"https://barttorvik.com/{year}_team_results.csv"
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
@@ -57,7 +236,7 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
-    # Normalize TEAM column
+    # TEAM
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -65,26 +244,10 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
             break
     if team_col is None:
         team_col = df.columns[0]
-
     df = df.rename(columns={team_col: "TEAM"})
     df["TEAM"] = df["TEAM"].astype(str).str.strip()
-    return df
 
-
-def find_col(df: pd.DataFrame, patterns: list[str]) -> str:
-    cols = list(df.columns)
-    for pat in patterns:
-        rx = re.compile(pat, re.IGNORECASE)
-        for c in cols:
-            if rx.search(str(c)):
-                return c
-    raise KeyError(f"Could not find column matching: {patterns}. Columns: {cols}")
-
-
-def standardize(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Torvik columns vary slightly by year; this is a robust finder
+    # Ratings
     df = df.rename(columns={
         find_col(df, ["AdjOE", r"\bOE\b"]): "ADJ_OE",
         find_col(df, ["AdjDE", r"\bDE\b"]): "ADJ_DE",
@@ -93,25 +256,21 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
     try:
         df = df.rename(columns={find_col(df, ["AdjT", "Tempo", "Pace", "Poss"]): "TEMPO"})
     except Exception:
-        pass
+        df["TEMPO"] = np.nan
 
     for c in ["ADJ_OE", "ADJ_DE", "TEMPO"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df
+    # if tempo missing, fill later in predict
+    return df[["TEAM", "ADJ_OE", "ADJ_DE", "TEMPO"]].copy()
 
 
-# ----------------------------
-# Slate source (ESPN scoreboard)  ✅ FIXED DOMAIN
-# ----------------------------
+# ============================
+# ESPN slate (correct endpoint)
+# ============================
 @st.cache_data(ttl=600)
 def fetch_espn_scoreboard(date_yyyymmdd: str):
-    """
-    IMPORTANT:
-    Use site.api.espn.com (works), not site.web.api.espn.com (often 404).
-    groups=50 pulls the full D1 slate.
-    """
+    # ✅ Use site.api.espn.com (works) + group 50 for D1
     url = (
         "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
         f"?dates={date_yyyymmdd}&groups=50&limit=500"
@@ -121,12 +280,11 @@ def fetch_espn_scoreboard(date_yyyymmdd: str):
 
 
 @st.cache_data(ttl=600)
-def get_espn_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
+def get_espn_daily_slate(date_val: dt.date):
     date_yyyymmdd = date_val.strftime("%Y%m%d")
     url, status, text = fetch_espn_scoreboard(date_yyyymmdd)
 
     debug = {"status": status, "url": url, "text_len": len(text)}
-
     if status != 200:
         return pd.DataFrame(), url, debug
 
@@ -146,7 +304,6 @@ def get_espn_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
             if not comps:
                 continue
             comp = comps[0]
-
             neutral = bool(comp.get("neutralSite", False))
 
             competitors = comp.get("competitors", [])
@@ -158,7 +315,7 @@ def get_espn_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
             for c in competitors:
                 ha = (c.get("homeAway") or "").lower()
                 team = c.get("team", {}) if isinstance(c.get("team"), dict) else {}
-                name = pick_first(team.get("shortDisplayName"), team.get("displayName"), team.get("name"))
+                name = team.get("shortDisplayName") or team.get("displayName") or team.get("name")
                 if ha == "away":
                     away = name
                 elif ha == "home":
@@ -177,14 +334,13 @@ def get_espn_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
     return df.reset_index(drop=True), url, debug
 
 
-# ----------------------------
+# ============================
 # Prediction engine
-# ----------------------------
-def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n: int, sd: float) -> dict:
-    lookup = {clean(t): t for t in df_teams["TEAM"].dropna().unique()}
-
-    away_team = resolve(away, lookup)
-    home_team = resolve(home, lookup)
+# ============================
+def predict_game(df_teams: pd.DataFrame, candidates, away: str, home: str, neutral: bool,
+                 hca: float, n: int, sd: float):
+    away_team, away_conf, away_second = auto_map_team(away, candidates, force_pick=True)
+    home_team, home_conf, home_second = auto_map_team(home, candidates, force_pick=True)
 
     a = df_teams[df_teams["TEAM"] == away_team].iloc[0]
     h = df_teams[df_teams["TEAM"] == home_team].iloc[0]
@@ -207,8 +363,12 @@ def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hc
     sims = np.random.default_rng(7).normal(loc=margin, scale=sd, size=n)
 
     return {
-        "Away": away_team,
-        "Home": home_team,
+        "Away_ESPN": away,
+        "Home_ESPN": home,
+        "Away_Torvik": away_team,
+        "Home_Torvik": home_team,
+        "Map_Conf_Away": away_conf,
+        "Map_Conf_Home": home_conf,
         "Neutral": bool(neutral),
         "Proj_Away": away_pts,
         "Proj_Home": home_pts,
@@ -219,36 +379,53 @@ def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hc
 
 
 def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float):
-    teams = standardize(load_torvik_team_results(season_year))
-    slate, slate_url, debug = get_espn_daily_slate(date_val)
+    teams = load_torvik_team_results(season_year)
+    torvik_team_list = teams["TEAM"].dropna().unique().tolist()
+    candidates = build_torvik_candidate_index(torvik_team_list)
 
+    slate, slate_url, debug = get_espn_daily_slate(date_val)
     if slate.empty:
         return pd.DataFrame(), slate_url, debug
 
     rows = []
     for _, row in slate.iterrows():
-        away = str(row["Away"]).strip()
-        home = str(row["Home"]).strip()
-        neutral = bool(int(row.get("Neutral", 0)))
-
         try:
-            pred = predict_game(teams, away, home, neutral, hca, n, sd)
-            pred["Matchup"] = row.get("Matchup", f"{away} at {home}")
+            pred = predict_game(
+                teams,
+                candidates,
+                away=str(row["Away"]).strip(),
+                home=str(row["Home"]).strip(),
+                neutral=bool(int(row.get("Neutral", 0))),
+                hca=float(hca),
+                n=int(n),
+                sd=float(sd),
+            )
+            pred["Matchup"] = row.get("Matchup")
             rows.append(pred)
         except Exception as e:
-            rows.append({"Matchup": row.get("Matchup", f"{away} at {home}"), "Error": str(e)})
+            rows.append({
+                "Matchup": row.get("Matchup"),
+                "Error": str(e),
+                "Away_ESPN": row.get("Away"),
+                "Home_ESPN": row.get("Home"),
+            })
 
     out = pd.DataFrame(rows)
-    if not out.empty and "Proj_Margin_Home" in out.columns:
+
+    if "Proj_Margin_Home" in out.columns:
         out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
         out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
+
+    # helpful flags: low-confidence mappings
+    if "Map_Conf_Away" in out.columns and "Map_Conf_Home" in out.columns:
+        out["Low_Conf_Map"] = (out["Map_Conf_Away"] < 0.78) | (out["Map_Conf_Home"] < 0.78)
 
     return out, slate_url, debug
 
 
-# ----------------------------
+# ============================
 # UI
-# ----------------------------
+# ============================
 st.set_page_config(page_title="CBB Slate Predictor", layout="wide")
 st.title("CBB Slate Predictor (ESPN slate + Torvik ratings)")
 
@@ -260,7 +437,7 @@ with st.sidebar:
     hca = st.slider("Home-court advantage (pts)", 0.0, 5.0, 2.5, step=0.5)
     sd = st.slider("Margin SD", 6.0, 18.0, 11.0, step=0.5)
     auto_run = st.checkbox("Run automatically", value=True)
-    show_debug = st.checkbox("Show debug", value=True)
+    show_debug = st.checkbox("Show debug", value=False)
     run_btn = st.button("Run slate")
 
 if auto_run or run_btn:
@@ -275,18 +452,36 @@ if auto_run or run_btn:
         st.warning("No games parsed from the ESPN feed for this date.")
         st.stop()
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader("Biggest projected margins")
-        st.dataframe(data.sort_values("Abs_Margin", ascending=False).head(25), use_container_width=True)
-    with c2:
-        st.subheader("Closest games")
-        st.dataframe(data.sort_values("Close_Game_Score", ascending=True).head(25), use_container_width=True)
-    with c3:
-        st.subheader("Highest projected totals")
-        st.dataframe(data.sort_values("Proj_Total", ascending=False).head(25), use_container_width=True)
+    # Split out errors vs good rows
+    has_error = data.columns.to_list()
+    err_rows = data[data.get("Error").notna()] if "Error" in data.columns else pd.DataFrame()
+    ok_rows = data[data.get("Error").isna()] if "Error" in data.columns else data
+
+    if not err_rows.empty:
+        st.warning(f"{len(err_rows)} games had errors (still shown below).")
+
+    # Top panels for ok rows only
+    if not ok_rows.empty and "Abs_Margin" in ok_rows.columns:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.subheader("Biggest projected margins")
+            st.dataframe(ok_rows.sort_values("Abs_Margin", ascending=False).head(25), use_container_width=True)
+        with c2:
+            st.subheader("Closest games")
+            st.dataframe(ok_rows.sort_values("Close_Game_Score", ascending=True).head(25), use_container_width=True)
+        with c3:
+            st.subheader("Highest projected totals")
+            st.dataframe(ok_rows.sort_values("Proj_Total", ascending=False).head(25), use_container_width=True)
 
     st.subheader("All games")
-    st.dataframe(data.sort_values("Matchup"), use_container_width=True)
+    # Sort with low confidence at top so you can eyeball it (no maintenance required)
+    if "Low_Conf_Map" in data.columns:
+        st.dataframe(
+            data.sort_values(["Low_Conf_Map", "Matchup"], ascending=[False, True]),
+            use_container_width=True
+        )
+    else:
+        st.dataframe(data.sort_values("Matchup"), use_container_width=True)
+
 else:
     st.info("Enable **Run automatically** or click **Run slate**.")
