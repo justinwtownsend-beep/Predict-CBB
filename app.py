@@ -22,6 +22,7 @@ def resolve(name: str, lookup: dict[str, str]) -> str:
     key = clean(name)
     if key in lookup:
         return lookup[key]
+    # fallback contains-match
     for k, v in lookup.items():
         if key in k or k in key:
             return v
@@ -53,6 +54,7 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
+    # Normalize TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -97,37 +99,23 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
-# NCAA Slate (fixed parser)
+# Slate source (ESPN scoreboard)
 # ----------------------------
-def _extract_team_name(team_obj: dict) -> str | None:
-    if not isinstance(team_obj, dict):
-        return None
-
-    names = team_obj.get("names")
-    if isinstance(names, dict):
-        return pick_first(names.get("short"), names.get("seo"), names.get("full"))
-
-    return pick_first(
-        team_obj.get("shortName"),
-        team_obj.get("displayName"),
-        team_obj.get("name"),
-        team_obj.get("team"),
-    )
-
-
 @st.cache_data(ttl=600)
-def fetch_ncaa_scoreboard(date_val: dt.date):
-    url = f"https://data.ncaa.com/casablanca/scoreboard/basketball-men/d1/{date_val:%Y/%m/%d}/scoreboard.json"
+def fetch_espn_scoreboard(date_yyyymmdd: str):
+    # ESPN mens college basketball scoreboard
+    url = (
+        "https://site.web.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard"
+        f"?dates={date_yyyymmdd}&limit=300"
+    )
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     return url, r.status_code, r.text
 
 
 @st.cache_data(ttl=600)
-def get_ncaa_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
-    """
-    Returns (slate_df, url, debug_dict)
-    """
-    url, status, text = fetch_ncaa_scoreboard(date_val)
+def get_espn_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
+    date_yyyymmdd = date_val.strftime("%Y%m%d")
+    url, status, text = fetch_espn_scoreboard(date_yyyymmdd)
 
     debug = {"status": status, "url": url, "text_len": len(text)}
 
@@ -140,59 +128,42 @@ def get_ncaa_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
         debug["json_error"] = str(e)
         return pd.DataFrame(), url, debug
 
-    debug["top_keys"] = list(data.keys()) if isinstance(data, dict) else str(type(data))
-
-    games_list = None
-    if isinstance(data, dict) and isinstance(data.get("games"), list):
-        games_list = data["games"]
-    elif isinstance(data, dict) and isinstance(data.get("scoreboard"), dict) and isinstance(data["scoreboard"].get("games"), list):
-        games_list = data["scoreboard"]["games"]
-    else:
-        games_list = []
-
-    debug["raw_games_count"] = len(games_list)
+    events = data.get("events", [])
+    debug["events_count"] = len(events) if isinstance(events, list) else 0
 
     rows = []
-    for item in games_list:
-        # ✅ KEY FIX: items are often {"game": {...}}
-        g = item.get("game") if isinstance(item, dict) and isinstance(item.get("game"), dict) else item
-        if not isinstance(g, dict):
-            continue
+    if isinstance(events, list):
+        for ev in events:
+            comps = ev.get("competitions", [])
+            if not comps:
+                continue
+            comp = comps[0]  # main competition
 
-        away_obj = g.get("away") if isinstance(g.get("away"), dict) else None
-        home_obj = g.get("home") if isinstance(g.get("home"), dict) else None
+            neutral = bool(comp.get("neutralSite", False))
 
-        away = _extract_team_name(away_obj) if away_obj else None
-        home = _extract_team_name(home_obj) if home_obj else None
+            competitors = comp.get("competitors", [])
+            if not isinstance(competitors, list) or len(competitors) < 2:
+                continue
 
-        # Fallback: sometimes teams appear under "teams": [{homeAway:"home"...}, ...]
-        if (not away or not home) and isinstance(g.get("teams"), list):
-            for t in g["teams"]:
-                if not isinstance(t, dict):
-                    continue
-                ha = (t.get("homeAway") or t.get("home_away") or "").lower()
-                nm = _extract_team_name(t) or pick_first(t.get("name"), t.get("shortName"), t.get("displayName"))
+            away = None
+            home = None
+            for c in competitors:
+                ha = (c.get("homeAway") or "").lower()
+                team = c.get("team", {}) if isinstance(c.get("team"), dict) else {}
+                name = pick_first(team.get("shortDisplayName"), team.get("displayName"), team.get("name"))
                 if ha == "away":
-                    away = nm
+                    away = name
                 elif ha == "home":
-                    home = nm
+                    home = name
 
-        if not away or not home:
-            continue
+            if not away or not home:
+                continue
 
-        neutral = bool(
-            g.get("neutralSite") or g.get("isNeutralSite") or g.get("neutral_site") or False
-        )
-
-        matchup = f"{away} vs {home}" if neutral else f"{away} at {home}"
-        rows.append({"Away": away, "Home": home, "Neutral": int(neutral), "Matchup": matchup})
+            matchup = f"{away} vs {home}" if neutral else f"{away} at {home}"
+            rows.append({"Away": away, "Home": home, "Neutral": int(neutral), "Matchup": matchup})
 
     if rows:
         debug["first_row"] = rows[0]
-    else:
-        # store a small sample of the first raw item keys for troubleshooting
-        if games_list:
-            debug["first_raw_item_keys"] = list(games_list[0].keys()) if isinstance(games_list[0], dict) else str(type(games_list[0]))
 
     df = pd.DataFrame(rows).drop_duplicates()
     return df.reset_index(drop=True), url, debug
@@ -241,7 +212,7 @@ def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hc
 
 def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float):
     teams = standardize(load_torvik_team_results(season_year))
-    slate, slate_url, debug = get_ncaa_daily_slate(date_val)
+    slate, slate_url, debug = get_espn_daily_slate(date_val)
 
     if slate.empty:
         return pd.DataFrame(), slate_url, debug
@@ -271,7 +242,7 @@ def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float
 # UI
 # ----------------------------
 st.set_page_config(page_title="CBB Slate Predictor", layout="wide")
-st.title("CBB Slate Predictor (NCAA slate + Torvik ratings)")
+st.title("CBB Slate Predictor (ESPN slate + Torvik ratings)")
 
 with st.sidebar:
     st.header("Settings")
@@ -289,11 +260,11 @@ if auto_run or run_btn:
     st.caption(f"Slate source: {slate_url}")
 
     if show_debug:
-        with st.expander("Debug (what NCAA feed returned)"):
+        with st.expander("Debug (what ESPN feed returned)"):
             st.json(debug)
 
     if data.empty:
-        st.warning("No games parsed from the NCAA feed for this date.")
+        st.warning("No games parsed from the ESPN feed for this date.")
         st.stop()
 
     c1, c2, c3 = st.columns(3)
