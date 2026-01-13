@@ -105,9 +105,9 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_espn_scoreboard(date_yyyymmdd: str):
     # ESPN mens college basketball scoreboard
     url = (
-        "https://site.web.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard"
-        f"?dates={date_yyyymmdd}&limit=300"
-    )
+    "https://site.web.api.espn.com/apis/v2/sports/basketball/leagues/mens-college-basketball/scoreboard"
+    f"?dates={date_yyyymmdd}&limit=300"
+)
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     return url, r.status_code, r.text
 
@@ -282,3 +282,4 @@ if auto_run or run_btn:
     st.dataframe(data.sort_values("Matchup"), use_container_width=True)
 else:
     st.info("Enable **Run automatically** or click **Run slate**.")
+
