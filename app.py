@@ -9,14 +9,32 @@ import streamlit as st
 
 
 # ----------------------------
+# Helpers
+# ----------------------------
+UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+def clean(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+def resolve(name: str, lookup: dict[str, str]) -> str:
+    key = clean(name)
+    if key in lookup:
+        return lookup[key]
+    for k, v in lookup.items():
+        if key in k or k in key:
+            return v
+    raise ValueError(f"Could not resolve team name: {name}")
+
+
+# ----------------------------
 # Torvik Ratings (safe loader)
 # ----------------------------
 @st.cache_data(ttl=3600)
 def load_torvik_team_results(year: int) -> pd.DataFrame:
     url = f"https://barttorvik.com/{year}_team_results.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    r = requests.get(url, headers=headers, timeout=30)
+    r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
 
     text = r.text
@@ -25,7 +43,6 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
-    # Normalize TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -51,13 +68,10 @@ def find_col(df: pd.DataFrame, patterns: list[str]) -> str:
 
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # Robust to Torvik column naming differences
     df = df.rename(columns={
         find_col(df, ["AdjOE", r"\bOE\b"]): "ADJ_OE",
         find_col(df, ["AdjDE", r"\bDE\b"]): "ADJ_DE",
     })
-
     try:
         df = df.rename(columns={find_col(df, ["AdjT", "Tempo", "Pace", "Poss"]): "TEMPO"})
     except Exception:
@@ -71,27 +85,28 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
-# Schedule (NEW: CSV endpoint, no HTML scraping)
+# Slate (use schedule.php&csv=1, no HTML tables)
 # ----------------------------
 @st.cache_data(ttl=600)
 def get_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
     """
-    Uses Torvik's CSV slate endpoint to avoid bot-blocking on schedule.php HTML.
+    Pull slate as CSV from schedule.php using &csv=1.
+    This avoids pandas read_html (No tables found) and Torvik HTML changes.
     """
-    url = f"https://barttorvik.com/schedule.csv?date={date_yyyymmdd}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://barttorvik.com/schedule.php?date={date_yyyymmdd}&conlimit=&csv=1"
 
     try:
-        r = requests.get(url, headers=headers, timeout=30)
+        r = requests.get(url, headers=UA_HEADERS, timeout=30)
         r.raise_for_status()
         text = r.text
     except Exception:
         return pd.DataFrame(), url
 
-    # If Torvik returns HTML instead of CSV
+    # If Torvik returns an HTML "verifying your browser" page, it will start with "<"
     if text.lstrip().startswith("<"):
         return pd.DataFrame(), url
 
+    # Try reading as CSV
     try:
         df = pd.read_csv(StringIO(text))
     except Exception:
@@ -99,45 +114,36 @@ def get_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Require at least Away/Home
-    if "Away" not in df.columns or "Home" not in df.columns:
+    # Need a matchup column (Torvik usually provides Matchup)
+    matchup_col = None
+    for c in df.columns:
+        if "matchup" in str(c).lower():
+            matchup_col = c
+            break
+    if matchup_col is None:
         return pd.DataFrame(), url
 
-    # Neutral is usually 0/1; if missing assume non-neutral
-    if "Neutral" not in df.columns:
-        df["Neutral"] = 0
+    df = df.rename(columns={matchup_col: "Matchup"})
+    df["Matchup"] = df["Matchup"].astype(str)
 
-    df["Neutral"] = pd.to_numeric(df["Neutral"], errors="coerce").fillna(0).astype(int)
-
-    df["Matchup"] = np.where(
-        df["Neutral"] == 1,
-        df["Away"].astype(str) + " vs " + df["Home"].astype(str),
-        df["Away"].astype(str) + " at " + df["Home"].astype(str),
-    )
-
-    return df.reset_index(drop=True), url
+    # Keep only real games
+    df = df[df["Matchup"].str.contains(r"\s(at|vs)\s", case=False, regex=True)].reset_index(drop=True)
+    return df, url
 
 
-# ----------------------------
-# Team name matching
-# ----------------------------
-def clean(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
-
-
-def resolve(name: str, lookup: dict[str, str]) -> str:
-    key = clean(name)
-    if key in lookup:
-        return lookup[key]
-    # fallback: contains match
-    for k, v in lookup.items():
-        if key in k or k in key:
-            return v
-    raise ValueError(f"Could not resolve team name: {name}")
+def parse_matchup(matchup: str):
+    m = str(matchup).strip()
+    if re.search(r"\s+vs\s+", m, flags=re.IGNORECASE):
+        a, h = re.split(r"\s+vs\s+", m, flags=re.IGNORECASE)
+        return a.strip(), h.strip(), True
+    if re.search(r"\s+at\s+", m, flags=re.IGNORECASE):
+        a, h = re.split(r"\s+at\s+", m, flags=re.IGNORECASE)
+        return a.strip(), h.strip(), False
+    return None, None, None
 
 
 # ----------------------------
-# Prediction engine
+# Prediction
 # ----------------------------
 def predict(df: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n: int, sd: float) -> dict:
     lookup = {clean(t): t for t in df["TEAM"].dropna().unique()}
@@ -178,7 +184,7 @@ def predict(df: pd.DataFrame, away: str, home: str, neutral: bool, hca: float, n
 
 
 def run(year: int, date_yyyymmdd: str, n: int, hca: float, sd: float) -> tuple[pd.DataFrame, str]:
-    df = standardize(load_torvik_team_results(year))
+    teams = standardize(load_torvik_team_results(year))
     slate, url = get_slate(date_yyyymmdd)
 
     if slate.empty:
@@ -186,19 +192,19 @@ def run(year: int, date_yyyymmdd: str, n: int, hca: float, sd: float) -> tuple[p
 
     rows = []
     for _, row in slate.iterrows():
-        away = str(row["Away"]).strip()
-        home = str(row["Home"]).strip()
-        neutral = bool(int(row.get("Neutral", 0)))
+        away, home, neutral = parse_matchup(row["Matchup"])
+        if away is None:
+            continue
 
         try:
-            r = predict(df, away, home, neutral, hca, n, sd)
-            r["Matchup"] = row.get("Matchup", f"{away} at {home}")
+            r = predict(teams, away, home, neutral, hca, n, sd)
+            r["Matchup"] = row["Matchup"]
             rows.append(r)
         except Exception as e:
-            rows.append({"Matchup": row.get("Matchup", f"{away} at {home}"), "Error": str(e)})
+            rows.append({"Matchup": row["Matchup"], "Error": str(e)})
 
     out = pd.DataFrame(rows)
-    if "Proj_Margin_Home" in out.columns:
+    if not out.empty and "Proj_Margin_Home" in out.columns:
         out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
         out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
 
@@ -228,7 +234,8 @@ if should_run:
     st.caption(f"Slate source: {url}")
 
     if data.empty:
-        st.warning("No games found for this date (or Torvik slate CSV returned empty).")
+        st.warning("No games found for this date (or Torvik blocked the CSV output).")
+        st.caption("If you KNOW there are games, open the slate source link above. If it shows an HTML verification page, Torvik is blocking Streamlit Cloud.")
         st.stop()
 
     if "Error" in data.columns and data.shape[1] <= 3:
