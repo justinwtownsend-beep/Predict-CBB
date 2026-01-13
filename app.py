@@ -7,10 +7,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-
-# ----------------------------
-# Config
-# ----------------------------
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 DEFAULT_POSSESSIONS = 68.0
 
@@ -32,11 +28,14 @@ def resolve(name: str, lookup: dict[str, str]) -> str:
     raise ValueError(f"Could not resolve team name: {name}")
 
 
-def _safe_num(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
+def pick_first(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        return v
+    return None
 
 
 # ----------------------------
@@ -44,9 +43,6 @@ def _safe_num(x, default=np.nan):
 # ----------------------------
 @st.cache_data(ttl=3600)
 def load_torvik_team_results(year: int) -> pd.DataFrame:
-    """
-    year=2026 corresponds to the 2025-26 season file: https://barttorvik.com/2026_team_results.csv
-    """
     url = f"https://barttorvik.com/{year}_team_results.csv"
     r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
@@ -57,7 +53,6 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
-    # Normalize TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -102,84 +97,105 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
-# Slate source (NCAA data feed)
+# NCAA Slate (fixed parser)
 # ----------------------------
+def _extract_team_name(team_obj: dict) -> str | None:
+    if not isinstance(team_obj, dict):
+        return None
+
+    names = team_obj.get("names")
+    if isinstance(names, dict):
+        return pick_first(names.get("short"), names.get("seo"), names.get("full"))
+
+    return pick_first(
+        team_obj.get("shortName"),
+        team_obj.get("displayName"),
+        team_obj.get("name"),
+        team_obj.get("team"),
+    )
+
+
 @st.cache_data(ttl=600)
-def get_ncaa_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str]:
-    """
-    NCAA scoreboard feed (men's D1):
-    https://data.ncaa.com/casablanca/scoreboard/basketball-men/d1/YYYY/MM/DD/scoreboard.json
-    """
+def fetch_ncaa_scoreboard(date_val: dt.date):
     url = f"https://data.ncaa.com/casablanca/scoreboard/basketball-men/d1/{date_val:%Y/%m/%d}/scoreboard.json"
+    r = requests.get(url, headers=UA_HEADERS, timeout=30)
+    return url, r.status_code, r.text
+
+
+@st.cache_data(ttl=600)
+def get_ncaa_daily_slate(date_val: dt.date) -> tuple[pd.DataFrame, str, dict]:
+    """
+    Returns (slate_df, url, debug_dict)
+    """
+    url, status, text = fetch_ncaa_scoreboard(date_val)
+
+    debug = {"status": status, "url": url, "text_len": len(text)}
+
+    if status != 200:
+        return pd.DataFrame(), url, debug
 
     try:
-        r = requests.get(url, headers=UA_HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return pd.DataFrame(), url
+        data = requests.models.complexjson.loads(text)
+    except Exception as e:
+        debug["json_error"] = str(e)
+        return pd.DataFrame(), url, debug
 
-    # The feed structure can vary; try common paths first.
-    games = None
-    if isinstance(data, dict):
-        for key in ["games", "Game", "scoreboard", "events"]:
-            if key in data and isinstance(data[key], list):
-                games = data[key]
-                break
+    debug["top_keys"] = list(data.keys()) if isinstance(data, dict) else str(type(data))
 
-    # If not found, try nested common patterns
-    if games is None and isinstance(data, dict):
-        # Some NCAA feeds put games under "scoreboard" -> "games"
-        sb = data.get("scoreboard")
-        if isinstance(sb, dict) and isinstance(sb.get("games"), list):
-            games = sb["games"]
+    games_list = None
+    if isinstance(data, dict) and isinstance(data.get("games"), list):
+        games_list = data["games"]
+    elif isinstance(data, dict) and isinstance(data.get("scoreboard"), dict) and isinstance(data["scoreboard"].get("games"), list):
+        games_list = data["scoreboard"]["games"]
+    else:
+        games_list = []
 
-    if not isinstance(games, list) or len(games) == 0:
-        return pd.DataFrame(), url
+    debug["raw_games_count"] = len(games_list)
 
     rows = []
-    for g in games:
+    for item in games_list:
+        # ✅ KEY FIX: items are often {"game": {...}}
+        g = item.get("game") if isinstance(item, dict) and isinstance(item.get("game"), dict) else item
         if not isinstance(g, dict):
             continue
 
-        # Try to find team names in a robust way
-        away = None
-        home = None
-        neutral = False
+        away_obj = g.get("away") if isinstance(g.get("away"), dict) else None
+        home_obj = g.get("home") if isinstance(g.get("home"), dict) else None
 
-        # Common keys in NCAA payloads
-        # - "away" / "home" objects with "names" or "shortName"
-        a_obj = g.get("away") if isinstance(g.get("away"), dict) else None
-        h_obj = g.get("home") if isinstance(g.get("home"), dict) else None
+        away = _extract_team_name(away_obj) if away_obj else None
+        home = _extract_team_name(home_obj) if home_obj else None
 
-        if a_obj:
-            away = a_obj.get("shortName") or a_obj.get("name") or a_obj.get("displayName")
-        if h_obj:
-            home = h_obj.get("shortName") or h_obj.get("name") or h_obj.get("displayName")
-
-        # Sometimes teams appear under "teams": [{"homeAway":"home",...}, ...]
+        # Fallback: sometimes teams appear under "teams": [{homeAway:"home"...}, ...]
         if (not away or not home) and isinstance(g.get("teams"), list):
             for t in g["teams"]:
                 if not isinstance(t, dict):
                     continue
                 ha = (t.get("homeAway") or t.get("home_away") or "").lower()
-                nm = t.get("shortName") or t.get("name") or t.get("displayName")
+                nm = _extract_team_name(t) or pick_first(t.get("name"), t.get("shortName"), t.get("displayName"))
                 if ha == "away":
                     away = nm
                 elif ha == "home":
                     home = nm
 
-        # Neutral site flags (varies)
-        neutral = bool(g.get("neutralSite") or g.get("isNeutralSite") or g.get("neutral_site") or False)
-
         if not away or not home:
             continue
+
+        neutral = bool(
+            g.get("neutralSite") or g.get("isNeutralSite") or g.get("neutral_site") or False
+        )
 
         matchup = f"{away} vs {home}" if neutral else f"{away} at {home}"
         rows.append({"Away": away, "Home": home, "Neutral": int(neutral), "Matchup": matchup})
 
+    if rows:
+        debug["first_row"] = rows[0]
+    else:
+        # store a small sample of the first raw item keys for troubleshooting
+        if games_list:
+            debug["first_raw_item_keys"] = list(games_list[0].keys()) if isinstance(games_list[0], dict) else str(type(games_list[0]))
+
     df = pd.DataFrame(rows).drop_duplicates()
-    return df.reset_index(drop=True), url
+    return df.reset_index(drop=True), url, debug
 
 
 # ----------------------------
@@ -223,12 +239,12 @@ def predict_game(df_teams: pd.DataFrame, away: str, home: str, neutral: bool, hc
     }
 
 
-def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float) -> tuple[pd.DataFrame, str]:
+def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float):
     teams = standardize(load_torvik_team_results(season_year))
-    slate, slate_url = get_ncaa_daily_slate(date_val)
+    slate, slate_url, debug = get_ncaa_daily_slate(date_val)
 
     if slate.empty:
-        return pd.DataFrame(), slate_url
+        return pd.DataFrame(), slate_url, debug
 
     rows = []
     for _, row in slate.iterrows():
@@ -248,7 +264,7 @@ def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float
         out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
         out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
 
-    return out, slate_url
+    return out, slate_url, debug
 
 
 # ----------------------------
@@ -265,14 +281,19 @@ with st.sidebar:
     hca = st.slider("Home-court advantage (pts)", 0.0, 5.0, 2.5, step=0.5)
     sd = st.slider("Margin SD", 6.0, 18.0, 11.0, step=0.5)
     auto_run = st.checkbox("Run automatically", value=True)
+    show_debug = st.checkbox("Show debug", value=True)
     run_btn = st.button("Run slate")
 
 if auto_run or run_btn:
-    data, slate_url = run_slate(int(season), date_val, int(sims), float(hca), float(sd))
+    data, slate_url, debug = run_slate(int(season), date_val, int(sims), float(hca), float(sd))
     st.caption(f"Slate source: {slate_url}")
 
+    if show_debug:
+        with st.expander("Debug (what NCAA feed returned)"):
+            st.json(debug)
+
     if data.empty:
-        st.warning("No games returned from the NCAA feed for this date.")
+        st.warning("No games parsed from the NCAA feed for this date.")
         st.stop()
 
     c1, c2, c3 = st.columns(3)
