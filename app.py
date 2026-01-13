@@ -12,6 +12,7 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
     url = f"https://barttorvik.com/{year}_team_results.csv"
     df = pd.read_csv(url)
 
+    # Normalize TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -93,10 +94,14 @@ def resolve_team_name(user_input: str, lookup: dict[str, str]) -> str:
 
 
 # ----------------------------
-# Slate pull (safe)
+# Slate pull (UPDATED - picks correct table)
 # ----------------------------
 @st.cache_data(ttl=10 * 60)
 def get_torvik_daily_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
+    """
+    Pull Torvik daily schedule for a given date.
+    Fix: Torvik pages can have multiple tables. We select the one that contains a Matchup column.
+    """
     url = f"https://barttorvik.com/schedule.php?conlimit=&date={date_yyyymmdd}&sort=time"
 
     try:
@@ -107,20 +112,27 @@ def get_torvik_daily_slate(date_yyyymmdd: str) -> tuple[pd.DataFrame, str]:
     if not tables:
         return pd.DataFrame(), url
 
-    df = tables[0].copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    matchup_col = None
-    for c in df.columns:
-        if "matchup" in c.lower():
-            matchup_col = c
+    # ✅ pick the table that actually contains a matchup column
+    slate_df = None
+    for t in tables:
+        t = t.copy()
+        t.columns = [str(c).strip() for c in t.columns]
+        if any("matchup" in str(c).lower() for c in t.columns):
+            slate_df = t
             break
-    if matchup_col is None:
+
+    if slate_df is None:
         return pd.DataFrame(), url
 
-    df = df.rename(columns={matchup_col: "Matchup"})
-    df = df[df["Matchup"].astype(str).str.contains(r"\s(at|vs)\s", case=False, regex=True)].reset_index(drop=True)
-    return df, url
+    # Normalize matchup column
+    matchup_col = [c for c in slate_df.columns if "matchup" in str(c).lower()][0]
+    slate_df = slate_df.rename(columns={matchup_col: "Matchup"})
+
+    # Keep only rows that look like real games
+    slate_df["Matchup"] = slate_df["Matchup"].astype(str)
+    slate_df = slate_df[slate_df["Matchup"].str.contains(r"\s(at|vs)\s", case=False, regex=True)].reset_index(drop=True)
+
+    return slate_df, url
 
 
 def parse_matchup(matchup: str):
@@ -177,78 +189,4 @@ def predict_cbb_game(df_teams, away, home, neutral, hca_points, n_sims, margin_s
     }
 
 
-def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin_sd):
-    raw = load_torvik_team_results(year)
-    df_teams = standardize_torvik_columns(raw)
-
-    slate, slate_url = get_torvik_daily_slate(date_yyyymmdd)
-    if slate.empty:
-        return pd.DataFrame(), slate_url
-
-    rows = []
-    for _, r in slate.iterrows():
-        away, home, neutral = parse_matchup(r["Matchup"])
-        if away is None:
-            continue
-        try:
-            res = predict_cbb_game(df_teams, away, home, neutral, hca_points, n_sims, margin_sd)
-            res["Matchup"] = r["Matchup"]
-            rows.append(res)
-        except Exception as e:
-            rows.append({"Matchup": r["Matchup"], "Error": str(e)})
-
-    out = pd.DataFrame(rows)
-    if "Proj_Margin_Home" in out.columns:
-        out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
-        out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
-    return out, slate_url
-
-
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title="CBB Torvik Slate Predictor", layout="wide")
-st.title("CBB Torvik Slate Predictor")
-
-with st.sidebar:
-    st.header("Settings")
-    season_year = st.number_input("Season year (2026 = 2025–26)", value=2026, step=1)
-    date_val = st.date_input("Slate date", value=dt.date.today())
-    n_sims = st.slider("Simulations", 1000, 20000, 10000, step=1000)
-    hca_points = st.slider("Home-court advantage (pts)", 0.0, 5.0, 2.5, step=0.5)
-    margin_sd = st.slider("Margin SD", 6.0, 18.0, 11.0, step=0.5)
-    auto_run = st.checkbox("Run automatically", value=True)
-    run_btn = st.button("Run slate")
-
-date_yyyymmdd = date_val.strftime("%Y%m%d")
-
-should_run = auto_run or run_btn
-
-if should_run:
-    preds, slate_url = run_slate(int(season_year), date_yyyymmdd, int(n_sims), float(hca_points), float(margin_sd))
-    st.caption(f"Slate source: {slate_url}")
-
-    if preds.empty:
-        st.warning("No games found for this date on Torvik.")
-        st.stop()
-
-    if "Error" in preds.columns and preds.shape[1] <= 3:
-        st.error("Most matchups failed to resolve (team-name mismatch).")
-        st.dataframe(preds, use_container_width=True)
-        st.stop()
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader("Biggest projected margins")
-        st.dataframe(preds.sort_values("Abs_Margin", ascending=False).head(25), use_container_width=True)
-    with c2:
-        st.subheader("Closest games")
-        st.dataframe(preds.sort_values("Close_Game_Score", ascending=True).head(25), use_container_width=True)
-    with c3:
-        st.subheader("Highest projected totals")
-        st.dataframe(preds.sort_values("Proj_Total", ascending=False).head(25), use_container_width=True)
-
-    st.subheader("All games")
-    st.dataframe(preds.sort_values("Matchup"), use_container_width=True)
-else:
-    st.info("Use the sidebar and click **Run slate** (or enable **Run automatically**).")
+def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin
