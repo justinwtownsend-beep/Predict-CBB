@@ -189,4 +189,6 @@ def predict_cbb_game(df_teams, away, home, neutral, hca_points, n_sims, margin_s
     }
 
 
-def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin
+def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin_sd):
+
+
