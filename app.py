@@ -190,5 +190,48 @@ def predict_cbb_game(df_teams, away, home, neutral, hca_points, n_sims, margin_s
 
 
 def run_slate(year, date_yyyymmdd, n_sims, hca_points, margin_sd):
+    raw = load_torvik_team_results(year)
+    df_teams = standardize_torvik_columns(raw)
+
+    slate, slate_url = get_torvik_daily_slate(date_yyyymmdd)
+    if slate.empty:
+        return pd.DataFrame(), slate_url
+
+    rows = []
+
+    for _, r in slate.iterrows():
+        away, home, neutral = parse_matchup(r["Matchup"])
+        if away is None:
+            continue
+
+        try:
+            res = predict_cbb_game(
+                df_teams=df_teams,
+                away=away,
+                home=home,
+                neutral=neutral,
+                hca_points=hca_points,
+                n_sims=n_sims,
+                margin_sd=margin_sd
+            )
+
+            res["Matchup"] = r["Matchup"]
+            rows.append(res)
+
+        except Exception as e:
+            rows.append({
+                "Matchup": r["Matchup"],
+                "Error": str(e)
+            })
+
+    out = pd.DataFrame(rows)
+
+    if "Proj_Margin_Home" in out.columns:
+        out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
+        out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
+
+    return out, slate_url
+
+
 
 
