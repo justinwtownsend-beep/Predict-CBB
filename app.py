@@ -1,6 +1,6 @@
 # ================================
 # CBB TORVIK PREDICTOR (NO ODDS API)
-# - ESPN slate + Torvik ratings
+# - ESPN slate (FULL D1 via groups=50) + Torvik ratings
 # - Model spread/total + win%
 # - Optional: enter DK lines directly in-table (no upload) to compute edge/Kelly
 # ================================
@@ -28,11 +28,11 @@ STATE_PATH = os.path.join(DATA_DIR, "model_state.json")
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 DEFAULTS = {
-    "NATIONAL_AVG_OE": 107.0,   # D1 avg points/100 poss (approx)
+    "NATIONAL_AVG_OE": 107.0,   # approx D1 avg points/100 poss
     "LEAGUE_AVG_TEMPO": 68.0,   # avg tempo (poss/game)
     "HCA": 2.5,                # pts
     "BASE_SD": 11.0,           # baseline margin SD at avg tempo
-    "TOTAL_SD_MULT": 1.6,      # SD_total ≈ SD_margin * 1.6 (starter)
+    "TOTAL_SD_MULT": 1.6,      # SD_total ≈ SD_margin * 1.6
 }
 
 
@@ -77,9 +77,7 @@ def similarity(a: str, b: str) -> float:
 
 
 def auto_map_team(name: str, candidates: list[str]) -> tuple[str | None, float, float]:
-    """
-    Returns (best_match, score, bonus)
-    """
+    """Returns (best_match, score, bonus)."""
     if not candidates:
         return None, 0.0, 0.0
     best = max(candidates, key=lambda t: similarity(name, t))
@@ -113,37 +111,64 @@ def load_torvik(year: int) -> pd.DataFrame:
 
 
 # ================================
-# ESPN SLATE
+# ESPN SLATE (FIXED: FULL D1)
 # ================================
 
 @st.cache_data(ttl=600)
-def get_espn_slate(date_val: dt.date) -> pd.DataFrame:
+def get_espn_slate_full_d1(date_val: dt.date) -> tuple[pd.DataFrame, dict]:
+    """
+    ESPN defaults to a small set unless you pass groups=50 for D1.
+    This returns (df, debug).
+    """
     d = date_val.strftime("%Y%m%d")
-    url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?dates={d}"
-    r = requests.get(url, headers=UA_HEADERS, timeout=30)
-    r.raise_for_status()
+    base_url = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
+    params = {
+        "dates": d,
+        "groups": 50,   # <-- FULL D1
+        "limit": 300    # ESPN often caps at 100, but setting higher doesn't hurt
+    }
+
+    r = requests.get(base_url, params=params, headers=UA_HEADERS, timeout=30)
+    status = r.status_code
+
+    debug = {
+        "url": r.url,
+        "status": status,
+        "text_len": len(r.text or ""),
+        "events_count": None
+    }
+
+    if status != 200:
+        return pd.DataFrame(), debug
+
     data = r.json()
+    events = data.get("events", []) or []
+    debug["events_count"] = len(events)
 
     rows = []
-    for ev in data.get("events", []):
-        comp = ev["competitions"][0]
-        teams = comp["competitors"]
+    for ev in events:
+        try:
+            comp = ev["competitions"][0]
+            teams = comp["competitors"]
 
-        home = next(t for t in teams if t["homeAway"] == "home")
-        away = next(t for t in teams if t["homeAway"] == "away")
+            home = next(t for t in teams if t.get("homeAway") == "home")
+            away = next(t for t in teams if t.get("homeAway") == "away")
 
-        rows.append({
-            "Away_ESPN": away["team"]["shortDisplayName"],
-            "Home_ESPN": home["team"]["shortDisplayName"],
-            "Neutral": int(comp.get("neutralSite", False)),
-            "Matchup": f'{away["team"]["shortDisplayName"]} at {home["team"]["shortDisplayName"]}',
-        })
+            rows.append({
+                "Away_ESPN": away["team"]["shortDisplayName"],
+                "Home_ESPN": home["team"]["shortDisplayName"],
+                "Neutral": int(comp.get("neutralSite", False)),
+                "Matchup": f'{away["team"]["shortDisplayName"]} at {home["team"]["shortDisplayName"]}',
+            })
+        except Exception:
+            # skip any weird malformed event
+            continue
 
     df = pd.DataFrame(rows)
-    # de-dup just in case ESPN returns repeats
     if not df.empty:
         df = df.drop_duplicates(subset=["Away_ESPN", "Home_ESPN", "Neutral"])
-    return df
+
+    return df, debug
 
 
 # ================================
@@ -159,7 +184,6 @@ def possessions(a_tempo: float, h_tempo: float) -> float:
 
 
 def sd_scaled(base_sd: float, poss: float, avg_poss: float) -> float:
-    # Higher tempo => more variance
     return float(base_sd) * math.sqrt(float(poss) / float(avg_poss))
 
 
@@ -189,7 +213,6 @@ def p_home_covers(model_margin_home: float, sd_margin: float, home_spread: float
     m = float(model_margin_home)
     sd = max(float(sd_margin), 1e-9)
     s = float(home_spread)
-
     cover_threshold = abs(s) if s < 0 else -abs(s)
     z = (cover_threshold - m) / sd
     return 1.0 - normal_cdf(z)
@@ -226,14 +249,20 @@ edge_min = st.sidebar.slider("Min edge (%)", 0.0, 10.0, 3.0, 0.5) / 100.0
 kelly_frac = st.sidebar.slider("Kelly fraction", 0.05, 0.50, 0.25, 0.05)
 default_odds = st.sidebar.selectbox("Default odds", [-110, -105, -115, -120], index=0)
 
+show_debug = st.sidebar.checkbox("Show debug", value=True)
+
 run = st.button("Run Model", type="primary")
 
 if run:
     torvik = load_torvik(int(season_year))
-    slate = get_espn_slate(date_val)
+    slate, debug = get_espn_slate_full_d1(date_val)
+
+    if show_debug:
+        with st.expander("Debug (ESPN request)"):
+            st.json(debug)
 
     if slate.empty:
-        st.warning("No games returned from ESPN for this date.")
+        st.warning("No games returned from ESPN for this date (or ESPN returned an empty slate).")
         st.stop()
 
     team_list = torvik["TEAM"].tolist()
@@ -243,7 +272,6 @@ if run:
         away_team, away_score, _ = auto_map_team(g["Away_ESPN"], team_list)
         home_team, home_score, _ = auto_map_team(g["Home_ESPN"], team_list)
 
-        # If mapping is very weak, skip (prevents garbage)
         if away_team is None or home_team is None:
             continue
 
@@ -267,8 +295,7 @@ if run:
         proj_margin_home = h_pts - a_pts
         proj_total = h_pts + a_pts
 
-        # Model “fair lines”
-        model_spread_home = -proj_margin_home  # e.g. margin +4 => fair spread -4
+        model_spread_home = -proj_margin_home
         model_total = proj_total
         home_win_pct = 1.0 - normal_cdf((0.0 - proj_margin_home) / max(sd_margin, 1e-9))
 
@@ -288,8 +315,6 @@ if run:
             "SD_Total": float(sd_total),
             "MapScore_Away": float(away_score),
             "MapScore_Home": float(home_score),
-
-            # Optional user-entered betting lines (no uploads)
             "Book_Spread_Home": np.nan,
             "Book_Total": np.nan,
             "Odds_Spread": float(default_odds),
@@ -298,7 +323,7 @@ if run:
 
     df = pd.DataFrame(preds)
 
-    st.subheader("Model projections (no sportsbook needed)")
+    st.subheader(f"Model projections (games parsed: {len(df)})")
     st.dataframe(
         df[[
             "Matchup", "Proj_Home", "Proj_Away", "Proj_Total", "Proj_Margin_Home",
@@ -309,11 +334,8 @@ if run:
     )
 
     st.divider()
-    st.subheader("Optional: paste/type DraftKings lines right here (NO uploads)")
-    st.caption(
-        "Fill Book_Spread_Home (home -4.5 is -4.5) and/or Book_Total. "
-        "Odds default to your sidebar selection."
-    )
+    st.subheader("Optional: type/paste lines (no uploads)")
+    st.caption("Fill Book_Spread_Home and/or Book_Total. Odds default to your sidebar selection.")
 
     editable_cols = ["Book_Spread_Home", "Book_Total", "Odds_Spread", "Odds_Total"]
     edited = st.data_editor(
@@ -330,7 +352,6 @@ if run:
         key="lines_editor"
     )
 
-    # Compute edges if user entered lines
     out = edited.copy()
 
     out["P_Home_Cover"] = out.apply(
@@ -362,7 +383,7 @@ if run:
     )
 
     st.divider()
-    st.subheader("Best Bets (only for rows where you entered a line)")
+    st.subheader("Best Bets (only rows where you entered a line)")
 
     best = out.copy()
     best["Best_Edge"] = best[["Edge_Spread_Home", "Edge_Total_Over"]].max(axis=1)
