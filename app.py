@@ -192,7 +192,6 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
-    # TEAM column
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -200,10 +199,10 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
             break
     if team_col is None:
         team_col = df.columns[0]
+
     df = df.rename(columns={team_col: "TEAM"})
     df["TEAM"] = df["TEAM"].astype(str).str.strip()
 
-    # Ratings
     df = df.rename(columns={
         find_col(df, ["AdjOE", r"\bOE\b"]): "ADJ_OE",
         find_col(df, ["AdjDE", r"\bDE\b"]): "ADJ_DE",
@@ -238,12 +237,6 @@ def parse_espn_events(text: str):
 
 
 def get_games_from_events(events):
-    """
-    Returns rows with stable ESPN identifiers:
-      - event_id
-      - competition_id
-    plus team names and neutral flag
-    """
     rows = []
     if not isinstance(events, list):
         return rows
@@ -281,9 +274,7 @@ def get_games_from_events(events):
             continue
 
         status = comp.get("status", {}).get("type", {})
-        state = status.get("state")          # e.g., "pre", "in", "post"
         completed = bool(status.get("completed", False))
-
         matchup = f"{away} vs {home}" if neutral else f"{away} at {home}"
 
         rows.append({
@@ -293,7 +284,6 @@ def get_games_from_events(events):
             "Home_ESPN": home,
             "Neutral": int(neutral),
             "Matchup": matchup,
-            "state": state,
             "completed": int(completed),
             "Away_score": away_score,
             "Home_score": home_score,
@@ -324,22 +314,31 @@ def get_espn_daily(date_val: dt.date):
 
 
 # ============================
-# Model state + history
+# Model state + history (FIXED)
 # ============================
 def ensure_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Create state file if missing
     if not os.path.exists(STATE_PATH):
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULTS, f, indent=2)
+
+    # Create history file only if missing (do NOT overwrite)
     if not os.path.exists(HISTORY_PATH):
-        pd.DataFrame().to_csv(HISTORY_PATH, index=False)
+        # write an empty file with no rows; load_history handles emptiness safely
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            f.write("")
 
 
 def load_state():
     ensure_storage()
-    with open(STATE_PATH, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    # fill any missing defaults
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = dict(DEFAULTS)
+
     for k, v in DEFAULTS.items():
         d.setdefault(k, v)
     return d
@@ -352,10 +351,26 @@ def save_state(d: dict):
 
 
 def load_history() -> pd.DataFrame:
+    """
+    ✅ SAFE on Streamlit Cloud:
+    - missing file -> empty DF
+    - 0-byte file -> empty DF
+    - EmptyDataError -> empty DF
+    """
     ensure_storage()
-    if os.path.exists(HISTORY_PATH) and os.path.getsize(HISTORY_PATH) > 0:
-        return pd.read_csv(HISTORY_PATH)
-    return pd.DataFrame()
+
+    if (not os.path.exists(HISTORY_PATH)) or (os.path.getsize(HISTORY_PATH) == 0):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(HISTORY_PATH)
+        # if file has only headers and no rows, pd.read_csv returns empty df, which is fine
+        return df
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    except Exception:
+        # last-resort fail-safe
+        return pd.DataFrame()
 
 
 def append_history(df_new: pd.DataFrame):
@@ -364,8 +379,8 @@ def append_history(df_new: pd.DataFrame):
     if hist.empty:
         df_new.to_csv(HISTORY_PATH, index=False)
         return
+
     combined = pd.concat([hist, df_new], ignore_index=True)
-    # de-dupe by competition_id if present
     if "competition_id" in combined.columns:
         combined = combined.drop_duplicates(subset=["competition_id"], keep="last")
     combined.to_csv(HISTORY_PATH, index=False)
@@ -396,7 +411,7 @@ def logistic(z: np.ndarray) -> np.ndarray:
 # ============================
 # Predict + Save
 # ============================
-def predict_slate(season_year: int, date_val: dt.date, n_sims: int, state: dict, show_debug=False):
+def predict_slate(season_year: int, date_val: dt.date, n_sims: int, state: dict):
     teams = load_torvik_team_results(season_year)
     torvik_team_list = teams["TEAM"].dropna().unique().tolist()
     candidates = build_torvik_candidate_index(torvik_team_list)
@@ -440,11 +455,9 @@ def predict_slate(season_year: int, date_val: dt.date, n_sims: int, state: dict,
             margin = home_pts - away_pts
             total = home_pts + away_pts
 
-            # MC for distribution-y stats if you want them later
             sims = np.random.default_rng(7).normal(loc=margin, scale=sd_game, size=int(n_sims))
             home_win_mc = float((sims > 0).mean() * 100.0)
 
-            # Calibrated analytic win prob (fast + stable)
             z = (margin / sd_game) if sd_game > 0 else 0.0
             p_home = float(logistic(np.array([k_cal * z]))[0] * 100.0)
 
@@ -475,9 +488,8 @@ def predict_slate(season_year: int, date_val: dt.date, n_sims: int, state: dict,
                 "Proj_Total": total,
                 "Proj_Margin_Home": margin,
                 "Home_Win_%_MC": home_win_mc,
-                "Home_Win_%": p_home,   # calibrated analytic
+                "Home_Win_%": p_home,
 
-                # placeholders for results
                 "Final_Away": np.nan,
                 "Final_Home": np.nan,
                 "Final_Total": np.nan,
@@ -490,31 +502,25 @@ def predict_slate(season_year: int, date_val: dt.date, n_sims: int, state: dict,
                 "season_year": int(season_year),
                 "event_id": g.get("event_id"),
                 "competition_id": g.get("competition_id"),
-                "Matchup": g.get("Matchup"),
+                "Matchup": g.get("Matchup", f"{away_name} at {home_name}"),
                 "Error": str(e),
             })
 
-    out = pd.DataFrame(rows)
-    return out, slate_url, debug
+    return pd.DataFrame(rows), slate_url, debug
 
 
 # ============================
-# Update results (self-learning loop)
+# Update results + learn
 # ============================
 def update_results_from_espn_for_date(date_val: dt.date):
-    """
-    Fetch ESPN scoreboard for date, return a DF keyed by competition_id with final scores when completed.
-    """
     slate, _, debug = get_espn_daily(date_val)
     if slate.empty:
         return pd.DataFrame(), debug
 
-    # Only completed games with scores
     done = slate[(slate["completed"] == 1)].copy()
     if done.empty:
         return pd.DataFrame(), debug
 
-    # cast scores to numeric
     done["Away_score"] = pd.to_numeric(done["Away_score"], errors="coerce")
     done["Home_score"] = pd.to_numeric(done["Home_score"], errors="coerce")
     done = done.dropna(subset=["Away_score", "Home_score"])
@@ -530,9 +536,6 @@ def update_results_from_espn_for_date(date_val: dt.date):
 
 
 def update_history_with_results(history: pd.DataFrame) -> pd.DataFrame:
-    """
-    For any rows missing Completed=1, fetch results for their date and fill.
-    """
     if history.empty or "date" not in history.columns:
         return history
 
@@ -540,7 +543,6 @@ def update_history_with_results(history: pd.DataFrame) -> pd.DataFrame:
     if "Completed" not in history.columns:
         history["Completed"] = 0
 
-    # dates that still need updates
     need = history[(history["Completed"].fillna(0).astype(int) == 0) & history["competition_id"].notna()]
     if need.empty:
         return history
@@ -552,7 +554,6 @@ def update_history_with_results(history: pd.DataFrame) -> pd.DataFrame:
             continue
         history = history.merge(finals, on="competition_id", how="left", suffixes=("", "_new"))
 
-        # fill only where new exists
         for col in ["Final_Away", "Final_Home", "Final_Total", "Final_Margin_Home", "Completed"]:
             newc = f"{col}_new"
             if newc in history.columns:
@@ -562,9 +563,6 @@ def update_history_with_results(history: pd.DataFrame) -> pd.DataFrame:
     return history
 
 
-# ============================
-# Learning (parameter tuning)
-# ============================
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -583,10 +581,6 @@ def logloss(y: np.ndarray, p: np.ndarray) -> float:
 
 
 def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
-    """
-    Grid-search a few parameters to minimize RMSE on margin and total, plus calibrate win%.
-    Uses only completed games.
-    """
     hist = history.copy()
     if hist.empty:
         return state, {"msg": "No history to learn from."}
@@ -595,7 +589,6 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
         return state, {"msg": "History missing Completed column."}
 
     done = hist[hist["Completed"].fillna(0).astype(int) == 1].copy()
-    # require predictions + finals
     need_cols = ["Proj_Margin_Home", "Final_Margin_Home", "Proj_Total", "Final_Total", "Possessions"]
     for c in need_cols:
         if c not in done.columns:
@@ -607,37 +600,8 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
 
     done = done.tail(int(max_rows))
 
-    # We tune by correcting systematic bias:
-    # - nat_avg_oe shifts both team scoring expectations
-    # - hca shifts margins in non-neutral games
-    # - base_sd affects calibration + MC spread; here we fit sd to margin residuals scaled by tempo
-    #
-    # We'll optimize nat_avg + hca by minimizing RMSE on margin and total.
-    # Then base_sd by matching residual SD vs tempo.
-
-    # Precompute some pieces to allow fast evaluation:
-    # Our model already produced Proj_* values using current state.
-    # For tuning nat_avg/hca, we'd ideally recompute projections.
-    # But we can approximate adjustments:
-    # - changing nat_avg_oe shifts both away_pp100/home_pp100 by (-delta_nat_avg),
-    #   so total shifts by (-2 * delta_nat_avg / 100 * poss) and margin does NOT change from nat_avg alone.
-    # Actually, nat_avg affects both teams equally in our formula, so margin stays mostly unchanged.
-    # It *does* affect total strongly. Good.
-    #
-    # For HCA: margin shifts by delta_hca for non-neutral games (because home +hca/2, away -hca/2 => +hca margin).
-    #
-    # So:
-    #   new_total = old_total + (-2*delta_nat_avg/100)*poss
-    #   new_margin = old_margin + delta_hca*(1-neutral)
-    #
-    # This makes tuning very stable without refetching Torvik.
-
     poss = done["Possessions"].astype(float).to_numpy()
-    neutral = done.get("Neutral", 0)
-    if "Neutral" in done.columns:
-        neutral = done["Neutral"].fillna(0).astype(int).to_numpy()
-    else:
-        neutral = np.zeros(len(done), dtype=int)
+    neutral = done["Neutral"].fillna(0).astype(int).to_numpy() if "Neutral" in done.columns else np.zeros(len(done), dtype=int)
 
     old_total = done["Proj_Total"].astype(float).to_numpy()
     old_margin = done["Proj_Margin_Home"].astype(float).to_numpy()
@@ -647,7 +611,7 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
     nat0 = float(state["NATIONAL_AVG_OE"])
     hca0 = float(state["HCA"])
 
-    nat_grid = np.arange(104.0, 110.5, 0.5)     # safe range
+    nat_grid = np.arange(104.0, 110.5, 0.5)
     hca_grid = np.arange(0.0, 5.25, 0.25)
 
     best = None
@@ -661,8 +625,8 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
 
             rmse_m = rmse(new_margin, y_margin)
             rmse_t = rmse(new_total, y_total)
+            score = rmse_m + 0.35 * rmse_t
 
-            score = rmse_m + 0.35 * rmse_t  # emphasize margin, still care about totals
             if (best is None) or (score < best["score"]):
                 best = {
                     "nat": float(nat),
@@ -672,9 +636,6 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
                     "score": score,
                 }
 
-    # Fit BASE_SD from residuals with tempo scaling:
-    # We expect residual SD ~ base_sd * sqrt(poss/avg_tempo)
-    # => base_sd ~ std(residual / sqrt(poss/avg_tempo))
     league_avg_tempo = float(state["LEAGUE_AVG_TEMPO"])
     scale = np.sqrt(np.maximum(poss, 1.0) / league_avg_tempo)
     resid = (y_margin - (old_margin + (best["hca"] - hca0) * (1 - neutral))).astype(float)
@@ -682,14 +643,10 @@ def learn_parameters(history: pd.DataFrame, state: dict, max_rows: int = 800):
     base_sd_hat = float(np.nanstd(resid_scaled, ddof=1))
     base_sd_hat = float(np.clip(base_sd_hat, 6.0, 18.0))
 
-    # Calibrate win probability scale K on z = margin/sd_game:
-    # y = 1 if home wins else 0
     y_win = (y_margin > 0).astype(float)
 
-    # use current per-game SD from history if available; otherwise recompute from poss + base_sd_hat
     if "SD_Game" in done.columns and done["SD_Game"].notna().any():
         sd_game = done["SD_Game"].astype(float).to_numpy()
-        # adjust sd_game to reflect base_sd_hat vs old base_sd
         old_base_sd = float(state["BASE_SD"])
         sd_game = sd_game * (base_sd_hat / old_base_sd) if old_base_sd > 0 else sd_game
     else:
@@ -768,18 +725,16 @@ def show_health(history_df: pd.DataFrame):
     st.caption(f"History rows: {n} | Completed with finals: {done} | Pending: {n - done}")
 
 
-# optional auto loop
-if auto_update and not history.empty:
-    history = update_history_with_results(history)
-    history.to_csv(HISTORY_PATH, index=False)
-    new_state, metrics = learn_parameters(history, state)
-    state = new_state
-    save_state(state)
-
 st.subheader("History status")
 show_health(history)
 
-# Run slate
+if auto_update and not history.empty:
+    history = update_history_with_results(history)
+    history.to_csv(HISTORY_PATH, index=False)
+    new_state, _metrics = learn_parameters(history, state)
+    state = new_state
+    save_state(state)
+
 if run_btn:
     preds, slate_url, dbg = predict_slate(int(season), date_val, int(n_sims), state)
     st.caption(f"Slate source: {slate_url}")
@@ -795,12 +750,10 @@ if run_btn:
         history = load_history()
 
         st.success(f"Saved {len(preds)} predictions to history.")
-        # show slate outputs
         ok = preds[preds.get("Error").isna()] if "Error" in preds.columns else preds
         st.subheader("All games (new predictions)")
         st.dataframe(ok.sort_values(["Low_Conf_Map", "Matchup"], ascending=[False, True]), use_container_width=True)
 
-# Update results + learn
 if update_btn:
     if history.empty:
         st.warning("No history to update. Run a slate first.")
@@ -826,14 +779,14 @@ if update_btn:
             "K calibration": state["K_CAL"],
         })
 
-# Show latest completed performance
 if not history.empty and "Completed" in history.columns:
     done = history[history["Completed"].fillna(0).astype(int) == 1].copy()
     if not done.empty and all(c in done.columns for c in ["Proj_Margin_Home", "Final_Margin_Home", "Proj_Total", "Final_Total"]):
         done = done.dropna(subset=["Proj_Margin_Home", "Final_Margin_Home", "Proj_Total", "Final_Total"])
         if not done.empty:
             st.subheader("Model performance (completed games)")
-            rmse_m = rmse(done["Proj_Margin_Home"], done["Final_Margin_Home"])
-            rmse_t = rmse(done["Proj_Total"], done["Final_Total"])
-            st.write({"RMSE margin": rmse_m, "RMSE total": rmse_t})
+            st.write({
+                "RMSE margin": rmse(done["Proj_Margin_Home"], done["Final_Margin_Home"]),
+                "RMSE total": rmse(done["Proj_Total"], done["Final_Total"])
+            })
             st.dataframe(done.tail(50), use_container_width=True)
