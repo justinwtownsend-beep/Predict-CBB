@@ -14,44 +14,30 @@ import streamlit as st
 # ============================
 UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
 DEFAULT_POSSESSIONS = 68.0
+NATIONAL_AVG_OE = 107.0          # baseline for D1 (points per 100 poss)
+LEAGUE_AVG_TEMPO = 68.0          # baseline tempo for SD scaling
 
 
 # ============================
-# Text normalization + matching
+# Text normalization + auto mapping (no manual maintenance)
 # ============================
-STOPWORDS = {
-    "university", "college", "the", "of", "and", "at", "a", "an",
-    "mens", "men", "womens", "women"
-}
+STOPWORDS = {"university", "college", "the", "of", "and", "at", "a", "an", "mens", "men", "womens", "women"}
 
 ABBREV_MAP = {
-    "st": "state",
-    "st.": "state",
+    "st": "state", "st.": "state",
     "ste": "stephen",
-    "ft": "fort",
-    "ft.": "fort",
-    "mt": "mount",
-    "mt.": "mount",
-    "u": "university",
-    "univ": "university",
-    "tech": "tech",
-    "a&m": "am",
-    "aandm": "am",
+    "ft": "fort", "ft.": "fort",
+    "mt": "mount", "mt.": "mount",
+    "u": "university", "univ": "university",
+    "a&m": "am", "aandm": "am",
     "&": "and",
 }
 
 DIRECTION_MAP = {
-    "n": "north",
-    "s": "south",
-    "e": "east",
-    "w": "west",
-    "ne": "northeast",
-    "nw": "northwest",
-    "se": "southeast",
-    "sw": "southwest",
+    "n": "north", "s": "south", "e": "east", "w": "west",
+    "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
 }
 
-# Common ESPN shortenings that benefit from expansion
 SPECIAL_PHRASES = [
     ("md", "maryland"),
     ("ar", "arkansas"),
@@ -74,25 +60,19 @@ def _basic_clean(s: str) -> str:
 
 def tokenize(name: str) -> list[str]:
     s = _basic_clean(name)
-
-    # replace some punctuation that matters in team names
-    s = s.replace("-", " ")
-    s = s.replace(".", "")
+    s = s.replace("-", " ").replace(".", "")
     s = s.replace("&", " & ")
-
     parts = [p for p in s.split() if p]
 
     out = []
     for p in parts:
         if p in DIRECTION_MAP:
             out.append(DIRECTION_MAP[p])
-            continue
-        if p in ABBREV_MAP:
+        elif p in ABBREV_MAP:
             out.append(ABBREV_MAP[p])
-            continue
-        out.append(p)
+        else:
+            out.append(p)
 
-    # expand special phrases at token level (e.g., "md" -> "maryland")
     expanded = []
     for t in out:
         replaced = False
@@ -104,22 +84,19 @@ def tokenize(name: str) -> list[str]:
         if not replaced:
             expanded.append(t)
 
-    # drop stopwords
     expanded = [t for t in expanded if t not in STOPWORDS]
-
     return expanded
 
 
 def normalize_key(name: str) -> str:
-    toks = tokenize(name)
-    return "".join(toks)
+    return "".join(tokenize(name))
 
 
-def jaccard(a_tokens: set[str], b_tokens: set[str]) -> float:
-    if not a_tokens or not b_tokens:
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
         return 0.0
-    inter = len(a_tokens & b_tokens)
-    union = len(a_tokens | b_tokens)
+    inter = len(a & b)
+    union = len(a | b)
     return inter / union if union else 0.0
 
 
@@ -127,68 +104,39 @@ def seq_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def score_match(query_name: str, cand) -> float:
-    """
-    cand is a dict with:
-      - key: normalized string
-      - tokens: set[str]
-    """
+def score_match(query_name: str, cand: dict) -> float:
     q_key = normalize_key(query_name)
     q_tokens = set(tokenize(query_name))
-
-    # blend character similarity + token overlap
     s1 = seq_ratio(q_key, cand["key"])
     s2 = jaccard(q_tokens, cand["tokens"])
     return 0.65 * s1 + 0.35 * s2
 
 
 def generate_query_variants(name: str) -> list[str]:
-    """
-    Create a handful of variants so ESPN short names match Torvik more often.
-    """
     s = _basic_clean(name)
-
     variants = {s}
-
-    # common shortenings
     variants.add(s.replace(" st ", " state "))
     variants.add(s.replace(" st.", " state "))
     variants.add(s.replace(" & ", " and "))
     variants.add(s.replace(" a&m ", " am "))
 
-    # directional expansions
     for k, v in DIRECTION_MAP.items():
         variants.add(re.sub(rf"\b{k}\b", v, s))
 
-    # remove "the"
     variants.add(re.sub(r"\bthe\b", "", s).strip())
-
-    # remove punctuation again
     variants = {re.sub(r"\s+", " ", v).strip() for v in variants if v.strip()}
-
     return list(variants)
 
 
 @st.cache_data(ttl=3600)
 def build_torvik_candidate_index(torvik_teams: list[str]):
-    """
-    Precompute candidate keys/tokens for fast matching.
-    """
     cands = []
     for t in torvik_teams:
-        cands.append({
-            "team": t,
-            "key": normalize_key(t),
-            "tokens": set(tokenize(t)),
-        })
+        cands.append({"team": t, "key": normalize_key(t), "tokens": set(tokenize(t))})
     return cands
 
 
 def auto_map_team(name: str, candidates, force_pick: bool = True):
-    """
-    Returns: (mapped_team, confidence_score, second_best_score)
-    If force_pick=True, always returns the best candidate (even low confidence).
-    """
     best_team = None
     best_score = -1.0
     second_score = -1.0
@@ -212,7 +160,7 @@ def auto_map_team(name: str, candidates, force_pick: bool = True):
 
 
 # ============================
-# Torvik loader (robust)
+# Torvik loader
 # ============================
 def find_col(df: pd.DataFrame, patterns: list[str]) -> str:
     cols = list(df.columns)
@@ -236,7 +184,6 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
 
     df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
 
-    # TEAM
     team_col = None
     for c in df.columns:
         if c.strip().lower() in {"team", "teams", "teamname"} or c.strip().upper() == "TEAM":
@@ -244,10 +191,10 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
             break
     if team_col is None:
         team_col = df.columns[0]
+
     df = df.rename(columns={team_col: "TEAM"})
     df["TEAM"] = df["TEAM"].astype(str).str.strip()
 
-    # Ratings
     df = df.rename(columns={
         find_col(df, ["AdjOE", r"\bOE\b"]): "ADJ_OE",
         find_col(df, ["AdjDE", r"\bDE\b"]): "ADJ_DE",
@@ -261,16 +208,14 @@ def load_torvik_team_results(year: int) -> pd.DataFrame:
     for c in ["ADJ_OE", "ADJ_DE", "TEMPO"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # if tempo missing, fill later in predict
     return df[["TEAM", "ADJ_OE", "ADJ_DE", "TEMPO"]].copy()
 
 
 # ============================
-# ESPN slate (correct endpoint)
+# ESPN slate (reliable endpoint)
 # ============================
 @st.cache_data(ttl=600)
 def fetch_espn_scoreboard(date_yyyymmdd: str):
-    # ✅ Use site.api.espn.com (works) + group 50 for D1
     url = (
         "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
         f"?dates={date_yyyymmdd}&groups=50&limit=500"
@@ -335,22 +280,38 @@ def get_espn_daily_slate(date_val: dt.date):
 
 
 # ============================
-# Prediction engine
+# Pro prediction engine (Tier-1 upgrades)
 # ============================
-def predict_game(df_teams: pd.DataFrame, candidates, away: str, home: str, neutral: bool,
-                 hca: float, n: int, sd: float):
-    away_team, away_conf, away_second = auto_map_team(away, candidates, force_pick=True)
-    home_team, home_conf, home_second = auto_map_team(home, candidates, force_pick=True)
+def game_possessions(a_tempo: float, h_tempo: float) -> float:
+    poss = float(np.nanmean([a_tempo, h_tempo]))
+    if np.isnan(poss) or poss <= 0:
+        poss = DEFAULT_POSSESSIONS
+    return poss
+
+
+def tempo_scaled_sd(base_sd: float, poss: float) -> float:
+    # SD scales with sqrt(possessions / league_avg_possessions)
+    return float(base_sd * np.sqrt(max(poss, 1.0) / LEAGUE_AVG_TEMPO))
+
+
+def expected_pp100(team_oe: float, opp_de: float, nat_avg: float) -> float:
+    # ✅ Correct formula: Team AdjOE + Opp AdjDE - National Avg OE
+    return float(team_oe + opp_de - nat_avg)
+
+
+def predict_game_pro(df_teams: pd.DataFrame, candidates, away: str, home: str, neutral: bool,
+                     hca: float, n_sims: int, base_sd: float, nat_avg_oe: float):
+    away_team, away_conf, _ = auto_map_team(away, candidates, force_pick=True)
+    home_team, home_conf, _ = auto_map_team(home, candidates, force_pick=True)
 
     a = df_teams[df_teams["TEAM"] == away_team].iloc[0]
     h = df_teams[df_teams["TEAM"] == home_team].iloc[0]
 
-    poss = float(np.nanmean([a.get("TEMPO", np.nan), h.get("TEMPO", np.nan)]))
-    if np.isnan(poss):
-        poss = DEFAULT_POSSESSIONS
+    poss = game_possessions(a.get("TEMPO", np.nan), h.get("TEMPO", np.nan))
+    sd_game = tempo_scaled_sd(base_sd, poss)
 
-    away_pp100 = (float(a["ADJ_OE"]) + float(h["ADJ_DE"])) / 2.0
-    home_pp100 = (float(h["ADJ_OE"]) + float(a["ADJ_DE"])) / 2.0
+    away_pp100 = expected_pp100(a["ADJ_OE"], h["ADJ_DE"], nat_avg_oe)
+    home_pp100 = expected_pp100(h["ADJ_OE"], a["ADJ_DE"], nat_avg_oe)
 
     away_pts = (away_pp100 / 100.0) * poss
     home_pts = (home_pp100 / 100.0) * poss
@@ -360,9 +321,13 @@ def predict_game(df_teams: pd.DataFrame, candidates, away: str, home: str, neutr
         away_pts -= hca / 2.0
 
     margin = home_pts - away_pts
-    sims = np.random.default_rng(7).normal(loc=margin, scale=sd, size=n)
+
+    # Monte Carlo for totals/upset/blowout style stats
+    sims = np.random.default_rng(7).normal(loc=margin, scale=sd_game, size=int(n_sims))
+    home_win = float((sims > 0).mean() * 100.0)
 
     return {
+        "Matchup": f"{away} vs {home}" if neutral else f"{away} at {home}",
         "Away_ESPN": away,
         "Home_ESPN": home,
         "Away_Torvik": away_team,
@@ -370,15 +335,19 @@ def predict_game(df_teams: pd.DataFrame, candidates, away: str, home: str, neutr
         "Map_Conf_Away": away_conf,
         "Map_Conf_Home": home_conf,
         "Neutral": bool(neutral),
+        "Possessions": poss,
+        "SD_Game": sd_game,
+        "Away_pp100": away_pp100,
+        "Home_pp100": home_pp100,
         "Proj_Away": away_pts,
         "Proj_Home": home_pts,
         "Proj_Total": away_pts + home_pts,
         "Proj_Margin_Home": margin,
-        "Home_Win_%": float((sims > 0).mean() * 100.0),
+        "Home_Win_%": home_win,
     }
 
 
-def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float):
+def run_slate(season_year: int, date_val: dt.date, n_sims: int, hca: float, base_sd: float, nat_avg_oe: float):
     teams = load_torvik_team_results(season_year)
     torvik_team_list = teams["TEAM"].dropna().unique().tolist()
     candidates = build_torvik_candidate_index(torvik_team_list)
@@ -389,25 +358,24 @@ def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float
 
     rows = []
     for _, row in slate.iterrows():
+        away = str(row["Away"]).strip()
+        home = str(row["Home"]).strip()
+        neutral = bool(int(row.get("Neutral", 0)))
+
         try:
-            pred = predict_game(
-                teams,
-                candidates,
-                away=str(row["Away"]).strip(),
-                home=str(row["Home"]).strip(),
-                neutral=bool(int(row.get("Neutral", 0))),
-                hca=float(hca),
-                n=int(n),
-                sd=float(sd),
+            pred = predict_game_pro(
+                teams, candidates,
+                away=away, home=home, neutral=neutral,
+                hca=float(hca), n_sims=int(n_sims),
+                base_sd=float(base_sd), nat_avg_oe=float(nat_avg_oe),
             )
-            pred["Matchup"] = row.get("Matchup")
             rows.append(pred)
         except Exception as e:
             rows.append({
-                "Matchup": row.get("Matchup"),
+                "Matchup": row.get("Matchup", f"{away} at {home}"),
                 "Error": str(e),
-                "Away_ESPN": row.get("Away"),
-                "Home_ESPN": row.get("Home"),
+                "Away_ESPN": away,
+                "Home_ESPN": home,
             })
 
     out = pd.DataFrame(rows)
@@ -416,7 +384,6 @@ def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float
         out["Abs_Margin"] = out["Proj_Margin_Home"].abs()
         out["Close_Game_Score"] = (out["Home_Win_%"] - 50).abs()
 
-    # helpful flags: low-confidence mappings
     if "Map_Conf_Away" in out.columns and "Map_Conf_Home" in out.columns:
         out["Low_Conf_Map"] = (out["Map_Conf_Away"] < 0.78) | (out["Map_Conf_Home"] < 0.78)
 
@@ -426,22 +393,28 @@ def run_slate(season_year: int, date_val: dt.date, n: int, hca: float, sd: float
 # ============================
 # UI
 # ============================
-st.set_page_config(page_title="CBB Slate Predictor", layout="wide")
-st.title("CBB Slate Predictor (ESPN slate + Torvik ratings)")
+st.set_page_config(page_title="CBB Slate Predictor (Pro)", layout="wide")
+st.title("CBB Slate Predictor (ESPN slate + Torvik ratings) — Pro model")
 
 with st.sidebar:
     st.header("Settings")
     season = st.number_input("Season year (2026 = 2025–26)", value=2026, step=1)
     date_val = st.date_input("Slate date", value=dt.date.today())
-    sims = st.slider("Simulations", 1000, 20000, 10000, step=1000)
+
+    st.divider()
+    n_sims = st.slider("Simulations (MC)", 1000, 30000, 10000, step=1000)
     hca = st.slider("Home-court advantage (pts)", 0.0, 5.0, 2.5, step=0.5)
-    sd = st.slider("Margin SD", 6.0, 18.0, 11.0, step=0.5)
+
+    # Tier-1 new knobs
+    base_sd = st.slider("Base Margin SD", 6.0, 18.0, 11.0, step=0.5)
+    nat_avg = st.slider("National Avg OE (pts/100)", 102.0, 112.0, float(NATIONAL_AVG_OE), step=0.5)
+
     auto_run = st.checkbox("Run automatically", value=True)
     show_debug = st.checkbox("Show debug", value=False)
     run_btn = st.button("Run slate")
 
 if auto_run or run_btn:
-    data, slate_url, debug = run_slate(int(season), date_val, int(sims), float(hca), float(sd))
+    data, slate_url, debug = run_slate(int(season), date_val, int(n_sims), float(hca), float(base_sd), float(nat_avg))
     st.caption(f"Slate source: {slate_url}")
 
     if show_debug:
@@ -449,18 +422,15 @@ if auto_run or run_btn:
             st.json(debug)
 
     if data.empty:
-        st.warning("No games parsed from the ESPN feed for this date.")
+        st.warning("No games parsed from ESPN for this date.")
         st.stop()
 
-    # Split out errors vs good rows
-    has_error = data.columns.to_list()
     err_rows = data[data.get("Error").notna()] if "Error" in data.columns else pd.DataFrame()
     ok_rows = data[data.get("Error").isna()] if "Error" in data.columns else data
 
     if not err_rows.empty:
-        st.warning(f"{len(err_rows)} games had errors (still shown below).")
+        st.warning(f"{len(err_rows)} games had errors (shown below).")
 
-    # Top panels for ok rows only
     if not ok_rows.empty and "Abs_Margin" in ok_rows.columns:
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -474,7 +444,6 @@ if auto_run or run_btn:
             st.dataframe(ok_rows.sort_values("Proj_Total", ascending=False).head(25), use_container_width=True)
 
     st.subheader("All games")
-    # Sort with low confidence at top so you can eyeball it (no maintenance required)
     if "Low_Conf_Map" in data.columns:
         st.dataframe(
             data.sort_values(["Low_Conf_Map", "Matchup"], ascending=[False, True]),
@@ -482,6 +451,5 @@ if auto_run or run_btn:
         )
     else:
         st.dataframe(data.sort_values("Matchup"), use_container_width=True)
-
 else:
     st.info("Enable **Run automatically** or click **Run slate**.")
